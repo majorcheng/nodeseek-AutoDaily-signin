@@ -17,18 +17,21 @@ jobs:
         uses: actions/checkout@v3
       
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11.8'
+          python-version: '3.11'
 
-      - name: Install Chrome and Xvfb
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver xvfb
+          sudo apt-get install -y xvfb
           echo "Chrome version:"
-          chromium-browser --version
-          echo "ChromeDriver version:"
-          chromedriver --version
+          google-chrome --version
 
       - name: Install Python dependencies
         run: |
@@ -43,4 +46,4 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
         run: |
-          python nodeseek_daily.py
+          xvfb-run --auto-servernum python nodeseek_daily.py
