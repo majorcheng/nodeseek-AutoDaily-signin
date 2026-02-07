@@ -191,22 +191,21 @@ def setup_driver_and_cookies():
         options = uc.ChromeOptions()
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--disable-software-rasterizer')
         
         if headless:
             print("启用无头模式...")
-            options.add_argument('--headless')
-            # 添加以下参数来绕过 Cloudflare 检测
+            options.add_argument('--headless=new')
             options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('--disable-gpu')
             options.add_argument('--window-size=1920,1080')
-            # 设置 User-Agent
-            options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            options.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         
         print("正在启动Chrome...")
-        driver = uc.Chrome(options=options)
+        # 让 undetected-chromedriver 自动检测 Chrome 版本
+        driver = uc.Chrome(options=options, use_subprocess=True)
         
         if headless:
-            # 执行 JavaScript 来修改 webdriver 标记
             driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             driver.set_window_size(1920, 1080)
         
