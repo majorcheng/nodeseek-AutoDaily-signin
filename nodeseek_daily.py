@@ -501,7 +501,7 @@ def run_for_account(cookie_str, account_index):
         result["sign_in"] = click_sign_icon(driver)
         
         # 执行评论任务
-        # result["comments"] = nodeseek_comment(driver)
+        result["comments"] = nodeseek_comment(driver)
         
     finally:
         try:
@@ -524,11 +524,11 @@ if __name__ == "__main__":
     print(f"检测到 {config.account_count} 个账号")
     
     # 随机延迟执行
-    # delay_seconds = config.get_random_delay_seconds()
-    # if delay_seconds > 0:
-    #     delay_minutes = delay_seconds / 60
-    #     print(f"随机延迟执行: 等待 {delay_minutes:.1f} 分钟...")
-    #     time.sleep(delay_seconds)
+    delay_seconds = config.get_random_delay_seconds()
+    if delay_seconds > 0:
+        delay_minutes = delay_seconds / 60
+        print(f"随机延迟执行: 等待 {delay_minutes:.1f} 分钟...")
+        time.sleep(delay_seconds)
     
     # 为每个账号执行任务
     all_results = []
