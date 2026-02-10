@@ -47,7 +47,7 @@ class Config:
         
         # 随机延迟配置（分钟）
         delay_min_str = os.environ.get("NS_DELAY_MIN", "") or "0"
-        delay_max_str = os.environ.get("NS_DELAY_MAX", "") or "30"
+        delay_max_str = os.environ.get("NS_DELAY_MAX", "") or "10"
         self.delay_min = int(delay_min_str)
         self.delay_max = int(delay_max_str)
     
@@ -172,11 +172,42 @@ def check_login_status(driver):
         print(f"检测登录状态时出错: {str(e)}")
         return False
 
+def _parse_reward_from_text(text):
+    """从文本中解析鸡腿数量"""
+    import re
+    # 匹配多种格式: "获得 5 鸡腿", "鸡腿 5 个", "获得鸡腿5个", "踩到鸡腿5个"
+    match = re.search(r"获得\s*(\d+)\s*鸡腿|鸡腿\s*(\d+)\s*个|踩到鸡腿\s*(\d+)\s*个|得鸡腿(\d+)个", text)
+    if match:
+        return match.group(1) or match.group(2) or match.group(3) or match.group(4)
+    # 再尝试最宽泛的匹配：任意位置的"数字+鸡腿"或"鸡腿+数字"
+    match2 = re.search(r"(\d+)\s*(?:个?\s*鸡腿|鸡腿)", text)
+    if match2:
+        return match2.group(1)
+    return "未知"
+
+def _parse_reward_from_page(driver):
+    """从当前页面解析签到奖励数量"""
+    try:
+        # 优先从 .board-intro 面板解析
+        intros = driver.find_elements(By.CSS_SELECTOR, ".board-intro")
+        if intros:
+            text = intros[0].text
+            print(f"签到后面板文本: {text}")
+            result = _parse_reward_from_text(text)
+            if result != "未知":
+                return result
+        
+        # 其次从全局文本解析
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        return _parse_reward_from_text(body_text)
+    except Exception as e:
+        print(f"解析奖励时出错: {str(e)}")
+        return "未知"
+
 @retry(max_attempts=3, delay=5)
 def click_sign_icon(driver):
     """
     尝试点击签到图标并完成签到
-    返回: 
     返回: (status, message)
     - status: "success" | "already" | "failed"
     - message: 签到获得的鸡腿数量或状态描述
@@ -230,14 +261,7 @@ def click_sign_icon(driver):
             # 优先检查是否存在"已签到"关键词
             if "获得" in intro_text or "排名" in intro_text or "已签到" in intro_text:
                 print("✅ 检测到已签到关键词")
-                # 尝试解析获得的鸡腿数
-                import re
-                # 匹配 "获得 x 鸡腿" 或 "获得鸡腿 x 个"
-                match = re.search(r"获得\s*(\d+)\s*鸡腿|鸡腿\s*(\d+)\s*个", intro_text)
-                if match:
-                    count = match.group(1) if match.group(1) else match.group(2)
-                else:
-                    count = "未知"
+                count = _parse_reward_from_text(intro_text)
                 return "already", count
             
             # 检查是否有按钮
@@ -269,30 +293,16 @@ def click_sign_icon(driver):
                 time.sleep(0.5)
                 driver.execute_script("arguments[0].click();", target_button)
                 print("签到按钮点击成功")
-                driver.execute_script("arguments[0].click();", target_button)
-                print("签到按钮点击成功")
-                time.sleep(2)
+                time.sleep(3)
                 
-                # 点击后重新获取面板文本以确认奖励
-                try:
-                    new_intro = WebDriverWait(driver, 5).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, ".board-intro"))
-                    ).text
-                    import re
-                    match = re.search(r"获得\s*(\d+)\s*鸡腿|鸡腿\s*(\d+)\s*个", new_intro)
-                    if match:
-                        count = match.group(1) if match.group(1) else match.group(2)
-                    else:
-                        count = "未知"
-                    return "success", count
-                except:
-                    return "success", "未知"
+                # 点击后解析奖励数量
+                count = _parse_reward_from_page(driver)
+                return "success", count
                 
             if "还未签到" in intro_text:
                 print("❌ 检测到'还未签到'文本，但未找到按钮")
-                return "failed"
+                return "failed", "未找到按钮"
                 
-            print("❌ 无法确认签到状态 (面板无按钮且无明确已签到文本)")
             print("❌ 无法确认签到状态 (面板无按钮且无明确已签到文本)")
             return "failed", "无法确认状态"
 
@@ -324,27 +334,20 @@ def click_sign_icon(driver):
                     time.sleep(0.5)
                     driver.execute_script("arguments[0].click();", target_button)
                     print("全局按钮点击成功")
-                    time.sleep(2)
-                    print("全局按钮点击成功")
-                    time.sleep(2)
-                    return "success", "未知"
+                    time.sleep(3)
+                    
+                    # 点击后解析奖励数量
+                    count = _parse_reward_from_page(driver)
+                    return "success", count
             except Exception as e:
                 print(f"全局按钮查找失败: {str(e)}")
 
             # 有时候 .board-intro 加载慢或者结构变了，直接找关键文本确认是否已签到
             try:
-                # 检查是否存在包含"今日签到获得"的元素
                 success_msg = driver.find_elements(By.XPATH, "//*[contains(text(), '今日签到获得') or contains(text(), '当前排名')]")
                 if success_msg:
                     print(f"✅ 通过文本发现已签到信息: {success_msg[0].text}")
-                if success_msg:
-                    print(f"✅ 通过文本发现已签到信息: {success_msg[0].text}")
-                    import re
-                    match = re.search(r"获得\s*(\d+)\s*鸡腿|鸡腿\s*(\d+)\s*个", success_msg[0].text)
-                    if match:
-                        count = match.group(1) if match.group(1) else match.group(2)
-                    else:
-                        count = "未知"
+                    count = _parse_reward_from_text(success_msg[0].text)
                     return "already", count
             except:
                 pass
@@ -352,14 +355,7 @@ def click_sign_icon(driver):
             page_text = driver.find_element(By.TAG_NAME, "body").text
             if "今日已签到" in page_text or "签到成功" in page_text or "本次获得" in page_text:
                 print("✅ 全局文本检测到 '已签到' 相关字样")
-            if "今日已签到" in page_text or "签到成功" in page_text or "本次获得" in page_text:
-                print("✅ 全局文本检测到 '已签到' 相关字样")
-                import re
-                match = re.search(r"获得\s*(\d+)\s*鸡腿|鸡腿\s*(\d+)\s*个", page_text)
-                if match:
-                    count = match.group(1) if match.group(1) else match.group(2)
-                else:
-                    count = "未知"
+                count = _parse_reward_from_text(page_text)
                 return "already", count
                 
             if "登录" in page_text and "注册" in page_text and "个人中心" not in page_text:
@@ -369,7 +365,6 @@ def click_sign_icon(driver):
             print("❌ 无法确认签到状态")
             screenshot_path = "sign_intro_error.png"
             driver.save_screenshot(screenshot_path)
-            send_telegram_photo(screenshot_path, caption=f"❌ 签到状态未知\nURL: {current_url}")
             send_telegram_photo(screenshot_path, caption=f"❌ 签到状态未知\nURL: {current_url}")
             return "failed", "状态未知"
             
@@ -475,8 +470,8 @@ def nodeseek_comment(driver):
         
         # 过滤掉置顶帖
         valid_posts = [post for post in posts if not post.find_elements(By.CSS_SELECTOR, '.pined')]
-        # 随机选择 5-10 个帖子
-        post_count = random.randint(5, 10)
+        # 随机选择 3-5 个帖子
+        post_count = random.randint(3, 5)
         selected_posts = random.sample(valid_posts, min(post_count, len(valid_posts)))
         
         # 存储已选择的帖子URL
@@ -489,30 +484,51 @@ def nodeseek_comment(driver):
                 continue
         
         # 使用URL列表进行操作
+        consecutive_failures = 0  # 连续失败计数器
         for i, post_url in enumerate(selected_urls):
+            # 如果连续失败 2 次，可能是浏览器状态异常，停止评论
+            if consecutive_failures >= 2:
+                print(f"⚠️ 连续失败 {consecutive_failures} 次，停止评论任务以避免更多错误")
+                break
+            
             try:
                 print(f"正在处理第 {i+1} 个帖子")
                 driver.get(post_url)
+                time.sleep(3)  # 增加等待时间确保页面完全加载
+                
+                # 检查页面是否正常加载
+                if "Just a moment" in driver.title or "error" in driver.title.lower():
+                    print(f"⚠️ 页面加载异常，跳过此帖子")
+                    consecutive_failures += 1
+                    continue
                 
                 # 等待 CodeMirror 编辑器加载
                 editor = WebDriverWait(driver, 30).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, '.CodeMirror'))
                 )
                 
-                # 点击编辑器区域获取焦点
-                editor.click()
+                # 使用 JS 点击编辑器获取焦点（避免元素遮挡）
+                driver.execute_script("arguments[0].click();", editor)
                 time.sleep(0.5)
                 input_text = random.choice(randomInputStr)
 
-                # 模拟输入
-                actions = ActionChains(driver)
-                # 随机输入 randomInputStr
-                for char in input_text:
-                    actions.send_keys(char)
-                    actions.pause(random.uniform(0.1, 0.3))
-                actions.perform()
+                # 使用 JS 直接设置编辑器内容（更稳定）
+                try:
+                    driver.execute_script("""
+                        var cm = arguments[0].CodeMirror;
+                        if (cm) {
+                            cm.setValue(arguments[1]);
+                        }
+                    """, editor, input_text)
+                except:
+                    # 如果 JS 注入失败，回退到 ActionChains
+                    actions = ActionChains(driver)
+                    for char in input_text:
+                        actions.send_keys(char)
+                        actions.pause(random.uniform(0.1, 0.3))
+                    actions.perform()
                 
-                # 等待一下确保内容已经输入
+                # 等待确保内容已经输入
                 time.sleep(2)
                 
                 # 使用更精确的选择器定位提交按钮
@@ -527,14 +543,16 @@ def nodeseek_comment(driver):
                 
                 print(f"已在帖子 {post_url} 中完成评论")
                 comment_count += 1
+                consecutive_failures = 0  # 重置连续失败计数器
                 
-                # 随机等待 3-7 分钟后处理下一个帖子
-                wait_minutes = random.uniform(3, 7)
+                # 随机等待 1-2 分钟后处理下一个帖子
+                wait_minutes = random.uniform(1, 2)
                 print(f"等待 {wait_minutes:.1f} 分钟后继续...")
                 time.sleep(wait_minutes * 60)
                 
             except Exception as e:
                 print(f"处理帖子时出错: {str(e)}")
+                consecutive_failures += 1
                 # 尝试截图分析
                 try:
                     screenshot_path = f"comment_error_{i}.png"
@@ -545,6 +563,14 @@ def nodeseek_comment(driver):
                         send_telegram_photo(screenshot_path, caption=f"❌ 评论失败截图\n帖子: {post_url}\n错误: {str(e)}")
                 except:
                     pass
+                
+                # 尝试恢复浏览器状态（导航到一个安全页面）
+                try:
+                    driver.get("https://www.nodeseek.com")
+                    time.sleep(2)
+                except:
+                    print("⚠️ 浏览器状态可能已崩溃")
+                    break
                 continue
                 
         print("评论任务完成")
