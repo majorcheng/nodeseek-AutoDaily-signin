@@ -204,7 +204,6 @@ def _parse_reward_from_page(driver):
         print(f"解析奖励时出错: {str(e)}")
         return "未知"
 
-@retry(max_attempts=3, delay=5)
 def click_sign_icon(driver):
     """
     尝试点击签到图标并完成签到
@@ -696,20 +695,22 @@ if __name__ == "__main__":
 {sign_status} <b>状态</b>: {sign_result}
 🕒 {beijing_time}"""
     else:
-        # 多账号汇报
-        lines = ["🎯 <b>NodeSeek 多账号任务完成</b>\n"]
+        # 多账号汇报（极简科技风）
+        account_lines = []
         for i, r in enumerate(all_results):
             if r["error"]:
-                lines.append(f"❌ 账号{i+1}: {r['error']}")
+                account_lines.append(f"\u274c \u8d26\u53f7{i+1}: {r['error']}")
             else:
-                if r["sign_in"] == "success":
-                    sign = f"✅(+{r['reward']})"
-                elif r["sign_in"] == "already":
-                    sign = f"🟡({r['reward']})"
+                if r["sign_in"] in ("success", "already"):
+                    sign = f"\u2705 +{r['reward']}\ud83c\udf57"
                 else:
-                    sign = "❌"
-                lines.append(f"👤 账号{i+1}: 签到{sign} | 评论{r['comments']}条")
-        lines.append(f"\n⏰ 执行时间: 北京时间 {beijing_time}")
-        report_message = "\n".join(lines)
+                    sign = "\u274c"
+                account_lines.append(f"\ud83d\udc64 \u8d26\u53f7{i+1}: {sign} | \ud83d\udcac {r['comments']}\u6761")
+        accounts_str = "\n".join(account_lines)
+        report_message = f"""<b>NodeSeek \u6bcf\u65e5\u7b80\u62a5</b>
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+{accounts_str}
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+\ud83d\udd52 {beijing_time}"""
     
     send_telegram_message(report_message)
