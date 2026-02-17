@@ -70,7 +70,7 @@ class Config:
 config = Config()
 
 # 随机评论内容
-randomInputStr = ["bd","绑定","帮顶",":xhj007: ","好价","过来看一下"," :xhj025: ","咕噜咕噜","可以","  :xhj003: ","还可以","楼下"," :xhj010: ","bd一下"," :xhj027: "]
+randomInputStr = ["bd","绑定","帮顶",":xhj007: BD","好价","过来看一下"," :xhj025: 嚯","咕噜咕噜","可以","  :xhj003: 可以","还可以","楼下"," :xhj010: 顶","bd一下"," :xhj027: 哦"]
 
 def send_telegram_message(message):
     """
