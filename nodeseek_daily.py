@@ -469,8 +469,8 @@ def nodeseek_comment(driver):
         
         # 过滤掉置顶帖
         valid_posts = [post for post in posts if not post.find_elements(By.CSS_SELECTOR, '.pined')]
-        # 随机选择 3-5 个帖子
-        post_count = random.randint(3, 5)
+        # 随机选择 4-7 个帖子
+        post_count = random.randint(4, 7)
         selected_posts = random.sample(valid_posts, min(post_count, len(valid_posts)))
         
         # 存储已选择的帖子URL
