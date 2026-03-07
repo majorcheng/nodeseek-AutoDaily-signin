@@ -463,28 +463,95 @@ def retry(max_attempts=3, delay=5):
         return wrapper
     return decorator
 
+def build_cookie_payload(name, value):
+    """按站点实际行为构造 Cookie，避免把 host-only Cookie 错写成顶级域 Cookie"""
+    payload = {
+        'name': name,
+        'value': value,
+        'path': '/'
+    }
+
+    if name == 'cf_clearance':
+        payload['domain'] = '.nodeseek.com'
+
+    return payload
+
+
+def capture_login_diagnostics(driver, reason):
+    """登录检测失败时输出诊断信息，便于区分 Cookie 失效、风控或页面结构变化"""
+    current_url = '<unknown>'
+    title = '<unknown>'
+    body_preview = '<empty>'
+
+    try:
+        current_url = driver.current_url
+    except Exception:
+        pass
+
+    try:
+        title = driver.title
+    except Exception:
+        pass
+
+    try:
+        body_text = driver.find_element(By.TAG_NAME, 'body').text
+        normalized = ' '.join(body_text.split())
+        body_preview = normalized[:300] if normalized else '<empty>'
+    except Exception as exc:
+        body_preview = f'<获取页面文本失败: {str(exc)}>'
+
+    print(f"⚠️ 登录检测失败原因: {reason}")
+    print(f"当前URL: {current_url}")
+    print(f"页面标题: {title}")
+    print(f"页面预览: {body_preview}")
+
+    try:
+        screenshot_path = 'login_check_failed.png'
+        driver.save_screenshot(screenshot_path)
+        print(f"已保存登录检测截图: {screenshot_path}")
+    except Exception as exc:
+        print(f"保存登录检测截图失败: {str(exc)}")
+
+
 def check_login_status(driver):
     """
     检测 Cookie 是否有效（用户是否已登录）
-    返回: True 表示已登录，False 表示未登录或 Cookie 过期
+    返回: (True, None) 表示已登录；(False, reason) 表示未登录或遭遇风控
     """
     try:
         print("正在检测登录状态...")
+        current_title = driver.title or ''
+        if 'Just a moment' in current_title or 'Attention Required' in current_title:
+            reason = '登录检测阶段遭遇 Cloudflare/风控页'
+            capture_login_diagnostics(driver, reason)
+            return False, reason
+
         # 尝试查找用户头像或用户相关元素
         user_elements = driver.find_elements(By.CSS_SELECTOR, '.avatar, .nsk-user-avatar, [class*="avatar"]')
-        
+
         # 也检查是否存在登录按钮（未登录时会显示）
         login_buttons = driver.find_elements(By.XPATH, "//span[contains(text(), '登录')]")
-        
+
         if len(user_elements) > 0 and len(login_buttons) == 0:
             print("✅ 登录状态有效")
-            return True
+            return True, None
+
+        try:
+            page_text = driver.find_element(By.TAG_NAME, 'body').text
+        except Exception:
+            page_text = ''
+
+        if '登录' in page_text and '注册' in page_text and '个人中心' not in page_text:
+            reason = '落到登录页，Cookie 可能无效'
         else:
-            print("❌ Cookie 已过期或未登录")
-            return False
+            reason = '未识别到登录态，可能是风控、页面结构变动或 Cookie domain 不匹配'
+
+        capture_login_diagnostics(driver, reason)
+        return False, reason
     except Exception as e:
-        print(f"检测登录状态时出错: {str(e)}")
-        return False
+        reason = f'检测登录状态时出错: {str(e)}'
+        print(reason)
+        return False, reason
 
 def _parse_reward_from_text(text):
     """从文本中解析鸡腿数量"""
@@ -748,18 +815,15 @@ def setup_driver_and_cookies(cookie_str):
         
         # 等待页面加载完成
         time.sleep(5)
+        print("Cookie 域名策略: cf_clearance -> .nodeseek.com，其余 Cookie -> 当前主机 www.nodeseek.com")
         
         for cookie_item in cookie_str.split(';'):
             try:
                 name, value = cookie_item.strip().split('=', 1)
-                driver.add_cookie({
-                    'name': name, 
-                    'value': value, 
-                    'domain': '.nodeseek.com',
-                    'path': '/'
-                })
+                cookie_payload = build_cookie_payload(name.strip(), value.strip())
+                driver.add_cookie(cookie_payload)
             except Exception as e:
-                print(f"设置cookie出错: {str(e)}")
+                print(f"设置cookie出错: {name if 'name' in locals() else '<unknown>'} | {str(e)}")
                 continue
         
         print("刷新页面...")
@@ -938,8 +1002,9 @@ def run_for_account(cookie_str, account_index):
     
     try:
         # 检测登录状态
-        if not check_login_status(driver):
-            result["error"] = "Cookie 已过期"
+        login_ok, login_reason = check_login_status(driver)
+        if not login_ok:
+            result["error"] = login_reason or "Cookie 已过期"
             return result
         
         # 执行签到任务
