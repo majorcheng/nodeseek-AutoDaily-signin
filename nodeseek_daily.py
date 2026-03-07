@@ -5,21 +5,29 @@ Licensed under the MIT License.
 See LICENSE file in the project root for full license information.
 """
 import os
+import random
+import select
+import socket
+import ssl
+import threading
+import time
+import traceback
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
+
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-import random
-import time
-from datetime import datetime, timezone, timedelta
-import traceback
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from socketserver import ThreadingMixIn
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -50,6 +58,12 @@ class Config:
         delay_max_str = os.environ.get("NS_DELAY_MAX", "") or "10"
         self.delay_min = int(delay_min_str)
         self.delay_max = int(delay_max_str)
+
+        # 浏览器业务流量代理配置（仅影响 Selenium 的 Chrome）
+        proxy_url_env = os.environ.get("NS_PROXY_URL", "") or ""
+        self.proxy_url = proxy_url_env.strip()
+        proxy_insecure_env = os.environ.get("NS_PROXY_INSECURE", "true") or "true"
+        self.proxy_insecure = proxy_insecure_env.strip().lower() == "true"
     
     @property
     def account_count(self):
@@ -71,6 +85,306 @@ config = Config()
 
 # 随机评论内容
 randomInputStr = ["bd","绑定","帮顶",":xhj007: BD","好价","过来看一下"," :xhj025: 嚯","咕噜咕噜","可以","  :xhj003: 可以","还可以","楼下"," :xhj010: 顶","bd一下"," :xhj027: 哦"]
+
+
+def mask_proxy_url(proxy_url):
+    """隐藏代理地址中的敏感信息，避免日志泄露"""
+    if not proxy_url:
+        return "<未配置>"
+
+    try:
+        parsed = urlparse(proxy_url)
+        if not parsed.scheme or not parsed.hostname:
+            return "<无效代理地址>"
+
+        netloc = parsed.hostname
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+
+        if parsed.username or parsed.password:
+            return f"{parsed.scheme}://***:***@{netloc}"
+
+        return f"{parsed.scheme}://{netloc}"
+    except Exception:
+        return "<无效代理地址>"
+
+
+def _recv_until_header_end(sock, max_bytes=65536):
+    """读取 HTTP 响应头，直到遇到空行"""
+    buffer = b""
+    while b"\r\n\r\n" not in buffer and len(buffer) < max_bytes:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buffer += chunk
+    return buffer
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """支持多线程的本地 HTTP 代理桥"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class UpstreamProxyBridgeHandler(BaseHTTPRequestHandler):
+    """把本地请求转发到上游 HTTP/HTTPS 代理"""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "NodeSeekProxyBridge/1.0"
+
+    def log_message(self, format, *args):
+        return
+
+    def do_CONNECT(self):
+        self.server.bridge.handle_connect(self)
+
+    def do_GET(self):
+        self.server.bridge.handle_forward_request(self)
+
+    def do_POST(self):
+        self.server.bridge.handle_forward_request(self)
+
+    def do_HEAD(self):
+        self.server.bridge.handle_forward_request(self)
+
+    def do_OPTIONS(self):
+        self.server.bridge.handle_forward_request(self)
+
+    def do_PUT(self):
+        self.server.bridge.handle_forward_request(self)
+
+    def do_PATCH(self):
+        self.server.bridge.handle_forward_request(self)
+
+    def do_DELETE(self):
+        self.server.bridge.handle_forward_request(self)
+
+
+class BrowserProxyRuntime:
+    """为 Chrome 构建浏览器代理运行时，必要时启动本地桥接代理"""
+
+    def __init__(self, proxy_url, proxy_insecure=False):
+        self.proxy_url = proxy_url
+        self.proxy_insecure = proxy_insecure
+        self.parsed_proxy = self._parse_proxy_url(proxy_url)
+        self.server = None
+        self.server_thread = None
+        self.browser_proxy_url = None
+
+    @staticmethod
+    def _parse_proxy_url(proxy_url):
+        parsed = urlparse(proxy_url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("当前仅支持 http:// 或 https:// 代理")
+        if not parsed.hostname:
+            raise ValueError("代理地址缺少主机名")
+        if parsed.username or parsed.password:
+            raise ValueError("当前版本仅支持无认证代理")
+        return parsed
+
+    def start(self):
+        if self.parsed_proxy.scheme == "http":
+            self.browser_proxy_url = self._normalized_upstream_proxy_url()
+            print(f"🌐 浏览器业务流量将通过 HTTP 代理: {mask_proxy_url(self.browser_proxy_url)}")
+            return self.browser_proxy_url
+
+        if self.proxy_insecure:
+            print("⚠️ 已启用 NS_PROXY_INSECURE=true，将跳过上游 HTTPS 代理证书校验")
+
+        self._probe_https_proxy()
+        self.server = ThreadedHTTPServer(("127.0.0.1", 0), UpstreamProxyBridgeHandler)
+        self.server.bridge = self
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        local_port = self.server.server_address[1]
+        self.browser_proxy_url = f"http://127.0.0.1:{local_port}"
+        print(
+            "🌐 浏览器业务流量将通过本地代理桥接到上游 HTTPS 代理: "
+            f"{mask_proxy_url(self.proxy_url)} -> {self.browser_proxy_url}"
+        )
+        return self.browser_proxy_url
+
+    def stop(self):
+        if self.server:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception as exc:
+                print(f"关闭本地代理桥时出错: {str(exc)}")
+            finally:
+                self.server = None
+
+        if self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=2)
+        self.server_thread = None
+
+    def _normalized_upstream_proxy_url(self):
+        host = self.parsed_proxy.hostname
+        port = self.parsed_proxy.port or (80 if self.parsed_proxy.scheme == "http" else 443)
+        return f"{self.parsed_proxy.scheme}://{host}:{port}"
+
+    def open_upstream_socket(self):
+        host = self.parsed_proxy.hostname
+        port = self.parsed_proxy.port or (80 if self.parsed_proxy.scheme == "http" else 443)
+        raw_sock = socket.create_connection((host, port), timeout=10)
+
+        if self.parsed_proxy.scheme == "http":
+            return raw_sock
+
+        context = ssl.create_default_context()
+        if self.proxy_insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            server_hostname = None
+        else:
+            server_hostname = host
+
+        return context.wrap_socket(raw_sock, server_hostname=server_hostname)
+
+    def _probe_https_proxy(self):
+        target = "www.nodeseek.com:443"
+        upstream_sock = None
+        try:
+            upstream_sock = self.open_upstream_socket()
+            connect_request = (
+                f"CONNECT {target} HTTP/1.1\r\n"
+                f"Host: {target}\r\n"
+                "Proxy-Connection: Keep-Alive\r\n\r\n"
+            ).encode("utf-8")
+            upstream_sock.sendall(connect_request)
+            response_head = _recv_until_header_end(upstream_sock)
+            if not response_head:
+                raise RuntimeError("上游 HTTPS 代理未返回响应")
+
+            status_line = response_head.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+            if " 200 " not in f" {status_line} ":
+                raise RuntimeError(f"上游 HTTPS 代理 CONNECT 失败: {status_line}")
+
+            print(f"✅ 上游 HTTPS 代理探测成功: {mask_proxy_url(self.proxy_url)}")
+        finally:
+            if upstream_sock:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+
+    def handle_connect(self, handler):
+        upstream_sock = None
+        try:
+            target = handler.path
+            upstream_sock = self.open_upstream_socket()
+            connect_request = (
+                f"CONNECT {target} HTTP/1.1\r\n"
+                f"Host: {target}\r\n"
+                "Proxy-Connection: Keep-Alive\r\n\r\n"
+            ).encode("utf-8")
+            upstream_sock.sendall(connect_request)
+            response_head = _recv_until_header_end(upstream_sock)
+            if not response_head:
+                raise RuntimeError("上游代理未返回 CONNECT 响应")
+
+            status_line = response_head.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+            if " 200 " not in f" {status_line} ":
+                raise RuntimeError(status_line)
+
+            handler.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            self._relay_bidirectional(handler.connection, upstream_sock)
+        except Exception as exc:
+            try:
+                handler.send_error(502, f"上游代理 CONNECT 失败: {str(exc)}")
+            except Exception:
+                pass
+        finally:
+            if upstream_sock:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+
+    def handle_forward_request(self, handler):
+        upstream_sock = None
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0") or "0")
+            request_body = handler.rfile.read(content_length) if content_length > 0 else b""
+
+            header_lines = []
+            for key, value in handler.headers.items():
+                if key.lower() in ("proxy-connection", "connection"):
+                    continue
+                header_lines.append(f"{key}: {value}\r\n")
+
+            header_lines.append("Connection: close\r\n")
+            header_lines.append("Proxy-Connection: close\r\n")
+            request_bytes = (
+                f"{handler.command} {handler.path} {handler.request_version}\r\n".encode("utf-8")
+                + "".join(header_lines).encode("utf-8")
+                + b"\r\n"
+                + request_body
+            )
+
+            upstream_sock = self.open_upstream_socket()
+            upstream_sock.sendall(request_bytes)
+            while True:
+                chunk = upstream_sock.recv(65536)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+        except Exception as exc:
+            try:
+                handler.send_error(502, f"上游代理转发失败: {str(exc)}")
+            except Exception:
+                pass
+        finally:
+            if upstream_sock:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _relay_bidirectional(client_sock, upstream_sock):
+        sockets = [client_sock, upstream_sock]
+        for sock in sockets:
+            try:
+                sock.settimeout(None)
+            except Exception:
+                pass
+
+        while True:
+            readable, _, errored = select.select(sockets, [], sockets, 60)
+            if errored or not readable:
+                break
+
+            for source_sock in readable:
+                try:
+                    payload = source_sock.recv(65536)
+                except OSError:
+                    return
+
+                if not payload:
+                    return
+
+                target_sock = upstream_sock if source_sock is client_sock else client_sock
+                target_sock.sendall(payload)
+
+
+def build_browser_proxy_runtime():
+    """按配置初始化浏览器代理；失败时自动回退直连"""
+    if not config.proxy_url:
+        print("🌐 未配置 NS_PROXY_URL，浏览器业务流量将直连")
+        return None
+
+    try:
+        runtime = BrowserProxyRuntime(config.proxy_url, config.proxy_insecure)
+        runtime.start()
+        return runtime
+    except Exception as exc:
+        print(
+            "⚠️ 浏览器代理初始化失败，将自动回退直连: "
+            f"{mask_proxy_url(config.proxy_url)} | 错误: {str(exc)}"
+        )
+        return None
 
 def send_telegram_message(message):
     """
@@ -381,12 +695,14 @@ def setup_driver_and_cookies(cookie_str):
     """
     初始化浏览器并设置cookie的通用方法
     :param cookie_str: Cookie 字符串
-    返回: 设置好cookie的driver实例
+    返回: (设置好cookie的driver实例, 代理运行时)
     """
+    proxy_runtime = None
+    driver = None
     try:
         if not cookie_str:
             print("未找到cookie配置")
-            return None
+            return None, None
             
         print("开始初始化浏览器...")
         options = Options()
@@ -406,6 +722,11 @@ def setup_driver_and_cookies(cookie_str):
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_experimental_option('excludeSwitches', ['enable-automation'])
         options.add_experimental_option('useAutomationExtension', False)
+
+        # 仅对浏览器业务流量挂代理，不改动全局网络环境
+        proxy_runtime = build_browser_proxy_runtime()
+        if proxy_runtime and proxy_runtime.browser_proxy_url:
+            options.add_argument(f"--proxy-server={proxy_runtime.browser_proxy_url}")
         
         print("正在启动Chrome...")
         # 使用 webdriver-manager 自动管理 ChromeDriver 版本
@@ -445,13 +766,20 @@ def setup_driver_and_cookies(cookie_str):
         driver.refresh()
         time.sleep(5)  # 增加等待时间
         
-        return driver
+        return driver, proxy_runtime
         
     except Exception as e:
         print(f"设置浏览器和Cookie时出错: {str(e)}")
         print("详细错误信息:")
         print(traceback.format_exc())
-        return None
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        if proxy_runtime:
+            proxy_runtime.stop()
+        return None, None
 
 def nodeseek_comment(driver):
     """执行评论任务，返回成功评论数量"""
@@ -603,7 +931,7 @@ def run_for_account(cookie_str, account_index):
     print(f"开始处理账号 {account_index + 1}")
     print(f"{'='*50}")
     
-    driver = setup_driver_and_cookies(cookie_str)
+    driver, proxy_runtime = setup_driver_and_cookies(cookie_str)
     if not driver:
         result["error"] = "浏览器初始化失败"
         return result
@@ -627,6 +955,8 @@ def run_for_account(cookie_str, account_index):
             driver.quit()
         except:
             pass
+        if proxy_runtime:
+            proxy_runtime.stop()
     
     return result
 
@@ -635,7 +965,10 @@ if __name__ == "__main__":
     print("开始执行 NodeSeek 自动任务...")
     
     # 检查配置
-    print(f"当前配置: NS_RANDOM={config.ns_random}, HEADLESS={config.headless}")
+    print(
+        f"当前配置: NS_RANDOM={config.ns_random}, HEADLESS={config.headless}, "
+        f"PROXY={mask_proxy_url(config.proxy_url)}"
+    )
     if config.account_count == 0:
         print("未配置 Cookie，退出")
         send_telegram_message("❌ <b>NodeSeek 自动任务失败</b>\n\n未配置 NS_COOKIE 环境变量")

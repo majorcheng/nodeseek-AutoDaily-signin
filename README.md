@@ -47,6 +47,7 @@ session=abc123xyz; token=def456uvw; user_id=12345
 | `NS_COOKIE` | ✅ | NodeSeek Cookie，多账号用 `\|` 分隔 |
 | `NS_RANDOM` | ❌ | `true`(默认): 试试手气 / `false`: 鸡腿 x 5 |
 | `NS_COMMENT_URL` | ❌ | 评论区域 URL（默认交易区） |
+| `NS_PROXY_URL` | ❌ | 浏览器业务流量代理地址，支持 `http://host:port` 或 `https://host:port` |
 | `TG_BOT_TOKEN` | ❌ | Telegram Bot Token |
 | `TG_CHAT_ID` | ❌ | Telegram Chat ID |
 
@@ -58,6 +59,31 @@ session=abc123xyz; token=def456uvw; user_id=12345
 |--------|--------|------|
 | `NS_DELAY_MIN` | `0` | 随机延迟最小分钟 |
 | `NS_DELAY_MAX` | `10` | 随机延迟最大分钟 |
+| `NS_PROXY_INSECURE` | `true` | 仅在 `NS_PROXY_URL` 为 `https://...` 时生效；`true` 表示跳过上游代理证书校验 |
+
+## 🌐 代理配置说明
+
+- 代理只影响 **NodeSeek 浏览器动作**，也就是签到、评论、Cookie 登录检测等 Selenium 流量。
+- 不影响 `Telegram` 通知。
+- 不影响 `apt` / `pip` 安装依赖，也不影响 `webdriver_manager` 下载驱动。
+- 当前版本只支持 **无认证代理**。
+
+### GitHub Settings 推荐配置
+
+在 `Settings → Secrets and variables → Actions` 中添加：
+
+- `Secrets`
+  - `NS_PROXY_URL=https://your-proxy-host:port`
+- `Variables`
+  - `NS_PROXY_INSECURE=true`（默认即为 `true`；如需校验证书，可显式设为 `false`）
+
+### 行为说明
+
+- `NS_PROXY_URL` 未配置：浏览器直连。
+- `NS_PROXY_URL=http://...`：Chrome 直接走该 HTTP 代理。
+- `NS_PROXY_URL=https://...`：脚本会先在本地启动一个代理桥，再转发到你的上游 HTTPS 代理。
+- `NS_PROXY_INSECURE` 默认是 `true`，只会影响“**脚本连接上游 HTTPS 代理**”这一跳，不会关闭浏览器对 NodeSeek 网站本身的 HTTPS 校验。
+- 代理初始化失败时，脚本会打印原因并 **自动回退直连**。
 
 ## 📝 多账号配置示例
 
