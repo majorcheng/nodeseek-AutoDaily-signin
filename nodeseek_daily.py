@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import random
 import re
+import select
 import shutil
+import socket
+import ssl
 import tempfile
+import threading
 import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from typing import Any, Mapping, Sequence
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
@@ -352,16 +359,31 @@ def is_https_proxy_url(proxy_url: str) -> bool:
         return False
 
 
-def should_ignore_proxy_tls_errors(egress_mode: str, proxy_url: str | None = None) -> bool:
-    if egress_mode != EGRESS_PROXY:
+def proxy_requires_local_bridge(proxy_url: str) -> bool:
+    if not proxy_url:
         return False
-    upstream_proxy = proxy_url if proxy_url is not None else config.proxy_url
-    return bool(config.proxy_insecure and is_https_proxy_url(upstream_proxy or ""))
+
+    try:
+        parsed = urlparse(proxy_url)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in {"http", "https"}:
+            return False
+        return scheme == "https" or bool(parsed.username or parsed.password)
+    except Exception:
+        return False
 
 
 def build_proxy_failure_reason(exc: Exception, egress_mode: str) -> str:
     reason = f"浏览器初始化或首页引导失败: {exc}"
-    if "ERR_PROXY_CERTIFICATE_INVALID" not in str(exc):
+    error_text = str(exc)
+    proxy_tls_markers = (
+        "ERR_PROXY_CERTIFICATE_INVALID",
+        "CERTIFICATE_VERIFY_FAILED",
+        "SSLCertVerificationError",
+        "certificate verify failed",
+        "IP address mismatch",
+    )
+    if not any(marker in error_text for marker in proxy_tls_markers):
         return reason
 
     proxy_label = mask_proxy_url(config.proxy_url)
@@ -370,8 +392,14 @@ def build_proxy_failure_reason(exc: Exception, egress_mode: str) -> str:
     if not is_https_proxy_url(config.proxy_url):
         return f"{reason}（当前代理不是 HTTPS 代理；代理={proxy_label}）"
     if config.proxy_insecure:
-        return f"{reason}（已启用 NS_PROXY_INSECURE=true，但代理证书仍不被 Chromium 接受；代理={proxy_label}）"
-    return f"{reason}（当前为 HTTPS 代理，且 NS_PROXY_INSECURE=false；可改用有效证书代理，或显式开启 NS_PROXY_INSECURE；代理={proxy_label}）"
+        return (
+            f"{reason}（已启用 NS_PROXY_INSECURE=true；该开关只影响脚本连接上游 HTTPS 代理这一跳，"
+            f"如仍失败，请检查代理链路本身；代理={proxy_label}）"
+        )
+    return (
+        f"{reason}（当前为 HTTPS 代理，脚本会严格校验上游代理证书；"
+        f"可开启 NS_PROXY_INSECURE=true，或更换证书有效的代理；代理={proxy_label}）"
+    )
 
 
 def mask_proxy_url(proxy_url: str) -> str:
@@ -392,6 +420,314 @@ def mask_proxy_url(proxy_url: str) -> str:
         return f"{parsed.scheme}://{netloc}"
     except Exception:
         return "<无效代理地址>"
+
+
+def normalize_proxy_url_for_browser(proxy_url: str) -> str:
+    parsed = urlparse(proxy_url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("当前仅支持 http:// 或 https:// 代理")
+    if not parsed.hostname:
+        raise ValueError("代理地址缺少主机名")
+
+    port = parsed.port or (80 if scheme == "http" else 443)
+    return f"{scheme}://{parsed.hostname}:{port}"
+
+
+def _recv_until_header_end(sock: socket.socket, max_bytes: int = 65_536) -> bytes:
+    """读取 HTTP 响应头，直到遇到空行。"""
+    buffer = b""
+    while b"\r\n\r\n" not in buffer and len(buffer) < max_bytes:
+        chunk = sock.recv(4_096)
+        if not chunk:
+            break
+        buffer += chunk
+    return buffer
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """支持多线程的本地 HTTP 代理桥。"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class UpstreamProxyBridgeHandler(BaseHTTPRequestHandler):
+    """把本地请求转发到上游 HTTP/HTTPS 代理。"""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "NodeSeekProxyBridge/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def do_CONNECT(self) -> None:
+        self.server.bridge.handle_connect(self)  # type: ignore[attr-defined]
+
+    def do_GET(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+    def do_POST(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+    def do_HEAD(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+    def do_OPTIONS(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+    def do_PUT(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+    def do_PATCH(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+    def do_DELETE(self) -> None:
+        self.server.bridge.handle_forward_request(self)  # type: ignore[attr-defined]
+
+
+class BrowserProxyRuntime:
+    """为浏览器构建本地 HTTP 代理桥，屏蔽上游 HTTPS 代理细节。"""
+
+    def __init__(self, proxy_url: str, proxy_insecure: bool = False):
+        self.proxy_url = proxy_url
+        self.proxy_insecure = proxy_insecure
+        self.parsed_proxy = self._parse_proxy_url(proxy_url)
+        self.server: ThreadedHTTPServer | None = None
+        self.server_thread: threading.Thread | None = None
+        self.browser_proxy_url: str | None = None
+
+    @staticmethod
+    def _parse_proxy_url(proxy_url: str):
+        parsed = urlparse(proxy_url)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in {"http", "https"}:
+            raise ValueError("当前仅支持 http:// 或 https:// 代理")
+        if not parsed.hostname:
+            raise ValueError("代理地址缺少主机名")
+        if bool(parsed.username) != bool(parsed.password):
+            raise ValueError("代理认证需要同时提供用户名和密码")
+        return parsed
+
+    def start(self) -> str:
+        if not proxy_requires_local_bridge(self.proxy_url):
+            self.browser_proxy_url = normalize_proxy_url_for_browser(self.proxy_url)
+            print(f"🌐 浏览器业务流量将通过代理: {mask_proxy_url(self.browser_proxy_url)}")
+            return self.browser_proxy_url
+
+        if self.parsed_proxy.scheme == "https":
+            if self.proxy_insecure:
+                print("🧪 已启用 NS_PROXY_INSECURE=true，仅跳过脚本到上游 HTTPS 代理这一跳的证书校验")
+            else:
+                print(f"🔒 当前上游 HTTPS 代理将严格校验证书（NS_PROXY_INSECURE={config.proxy_insecure}）")
+            self._probe_https_proxy()
+
+        self.server = ThreadedHTTPServer(("127.0.0.1", 0), UpstreamProxyBridgeHandler)
+        self.server.bridge = self  # type: ignore[attr-defined]
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        local_port = int(self.server.server_address[1])
+        self.browser_proxy_url = f"http://127.0.0.1:{local_port}"
+        print(
+            "🌉 浏览器业务流量将通过本地 HTTP 代理桥: "
+            f"{self.browser_proxy_url} -> {mask_proxy_url(self.proxy_url)}"
+        )
+        return self.browser_proxy_url
+
+    def stop(self) -> None:
+        if self.server is not None:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception as exc:
+                print(f"关闭本地代理桥时出错: {exc}")
+            finally:
+                self.server = None
+
+        if self.server_thread is not None and self.server_thread.is_alive():
+            self.server_thread.join(timeout=2)
+        self.server_thread = None
+
+    def _proxy_authorization_value(self) -> str | None:
+        username = self.parsed_proxy.username
+        password = self.parsed_proxy.password
+        if username is None and password is None:
+            return None
+
+        credentials = f"{unquote(username or '')}:{unquote(password or '')}".encode("utf-8")
+        token = base64.b64encode(credentials).decode("ascii")
+        return f"Basic {token}"
+
+    def _build_connect_request(self, target: str) -> bytes:
+        header_lines = [
+            f"CONNECT {target} HTTP/1.1\r\n",
+            f"Host: {target}\r\n",
+            "Proxy-Connection: Keep-Alive\r\n",
+        ]
+        auth_value = self._proxy_authorization_value()
+        if auth_value:
+            header_lines.append(f"Proxy-Authorization: {auth_value}\r\n")
+        header_lines.append("\r\n")
+        return "".join(header_lines).encode("utf-8")
+
+    def open_upstream_socket(self) -> socket.socket:
+        host = self.parsed_proxy.hostname
+        port = self.parsed_proxy.port or (80 if self.parsed_proxy.scheme == "http" else 443)
+        raw_sock = socket.create_connection((host, port), timeout=10)
+
+        if self.parsed_proxy.scheme == "http":
+            return raw_sock
+
+        context = ssl.create_default_context()
+        if self.proxy_insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            server_hostname = None
+        else:
+            server_hostname = host
+
+        return context.wrap_socket(raw_sock, server_hostname=server_hostname)
+
+    def _probe_https_proxy(self) -> None:
+        if self.parsed_proxy.scheme != "https":
+            return
+
+        target = "www.nodeseek.com:443"
+        upstream_sock: socket.socket | None = None
+        try:
+            upstream_sock = self.open_upstream_socket()
+            upstream_sock.sendall(self._build_connect_request(target))
+            response_head = _recv_until_header_end(upstream_sock)
+            if not response_head:
+                raise RuntimeError("上游 HTTPS 代理未返回响应")
+
+            status_line = response_head.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+            if " 200 " not in f" {status_line} ":
+                raise RuntimeError(f"上游 HTTPS 代理 CONNECT 失败: {status_line}")
+
+            print(f"✅ 上游 HTTPS 代理探测成功: {mask_proxy_url(self.proxy_url)}")
+        finally:
+            if upstream_sock is not None:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+
+    def handle_connect(self, handler: BaseHTTPRequestHandler) -> None:
+        upstream_sock: socket.socket | None = None
+        try:
+            target = handler.path
+            upstream_sock = self.open_upstream_socket()
+            upstream_sock.sendall(self._build_connect_request(target))
+            response_head = _recv_until_header_end(upstream_sock)
+            if not response_head:
+                raise RuntimeError("上游代理未返回 CONNECT 响应")
+
+            status_line = response_head.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+            if " 200 " not in f" {status_line} ":
+                raise RuntimeError(status_line)
+
+            handler.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            self._relay_bidirectional(handler.connection, upstream_sock)
+        except Exception as exc:
+            try:
+                handler.send_error(502, f"上游代理 CONNECT 失败: {exc}")
+            except Exception:
+                pass
+        finally:
+            if upstream_sock is not None:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+
+    def handle_forward_request(self, handler: BaseHTTPRequestHandler) -> None:
+        upstream_sock: socket.socket | None = None
+        try:
+            content_length = int(handler.headers.get("Content-Length", "0") or "0")
+            request_body = handler.rfile.read(content_length) if content_length > 0 else b""
+
+            header_lines: list[str] = []
+            for key, value in handler.headers.items():
+                if key.lower() in {"proxy-authorization", "proxy-connection", "connection"}:
+                    continue
+                header_lines.append(f"{key}: {value}\r\n")
+
+            auth_value = self._proxy_authorization_value()
+            if auth_value:
+                header_lines.append(f"Proxy-Authorization: {auth_value}\r\n")
+
+            header_lines.append("Connection: close\r\n")
+            header_lines.append("Proxy-Connection: close\r\n")
+            request_bytes = (
+                f"{handler.command} {handler.path} {handler.request_version}\r\n".encode("utf-8")
+                + "".join(header_lines).encode("utf-8")
+                + b"\r\n"
+                + request_body
+            )
+
+            upstream_sock = self.open_upstream_socket()
+            upstream_sock.sendall(request_bytes)
+            while True:
+                chunk = upstream_sock.recv(65_536)
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+        except Exception as exc:
+            try:
+                handler.send_error(502, f"上游代理转发失败: {exc}")
+            except Exception:
+                pass
+        finally:
+            if upstream_sock is not None:
+                try:
+                    upstream_sock.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _relay_bidirectional(client_sock: socket.socket, upstream_sock: socket.socket) -> None:
+        sockets = [client_sock, upstream_sock]
+        for sock in sockets:
+            try:
+                sock.settimeout(None)
+            except Exception:
+                pass
+
+        while True:
+            readable, _, errored = select.select(sockets, [], sockets, 60)
+            if errored or not readable:
+                break
+
+            for source_sock in readable:
+                try:
+                    payload = source_sock.recv(65_536)
+                except OSError:
+                    return
+
+                if not payload:
+                    return
+
+                target_sock = upstream_sock if source_sock is client_sock else client_sock
+                target_sock.sendall(payload)
+
+
+def prepare_browser_proxy(egress_mode: str) -> tuple[str | None, BrowserProxyRuntime | None]:
+    if egress_mode != EGRESS_PROXY:
+        print("🌐 浏览器业务流量将直连")
+        return None, None
+
+    if not config.proxy_url:
+        raise RuntimeError("当前出口模式要求代理，但未配置 NS_PROXY_URL")
+
+    if proxy_requires_local_bridge(config.proxy_url):
+        runtime = BrowserProxyRuntime(config.proxy_url, config.proxy_insecure)
+        runtime.start()
+        return runtime.browser_proxy_url, runtime
+
+    browser_proxy = normalize_proxy_url_for_browser(config.proxy_url)
+    print(f"🌐 浏览器业务流量将通过代理: {mask_proxy_url(browser_proxy)}")
+    return browser_proxy, None
 
 
 def build_egress_candidates(egress_mode: Optional[str] = None, proxy_url: Optional[str] = None) -> list[str]:
@@ -817,13 +1153,42 @@ def send_telegram_photo(photo_path: str | Path, caption: str | None = None) -> b
         return False
 
 
+class ManagedStealthSession:
+    """统一管理 Scrapling 会话和可选本地代理桥生命周期。"""
+
+    def __init__(self, session: StealthySession, proxy_runtime: BrowserProxyRuntime | None = None):
+        self.session = session
+        self.proxy_runtime = proxy_runtime
+
+    def __enter__(self) -> StealthySession:
+        enter = getattr(self.session, "__enter__", None)
+        if callable(enter):
+            return enter()
+        return self.session
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        suppress_exception = False
+        try:
+            exit_method = getattr(self.session, "__exit__", None)
+            if callable(exit_method):
+                suppress_exception = bool(exit_method(exc_type, exc, tb))
+            else:
+                close_method = getattr(self.session, "close", None)
+                if callable(close_method):
+                    close_method()
+        finally:
+            if self.proxy_runtime is not None:
+                self.proxy_runtime.stop()
+        return suppress_exception
+
+
 def create_session(
     account_index: int,
     egress_mode: str,
     *,
     user_data_dir: Path | None = None,
     use_custom_fingerprint: bool = True,
-) -> StealthySession:
+) -> ManagedStealthSession:
     if SCRAPLING_IMPORT_ERROR is not None:
         raise RuntimeError(
             "未检测到 Scrapling 运行依赖，请先执行 `pip install -r requirements.txt`，"
@@ -835,45 +1200,42 @@ def create_session(
 
     account_state_dir = user_data_dir or build_account_state_dir(account_index)
     account_state_dir.mkdir(parents=True, exist_ok=True)
-    proxy = config.proxy_url if egress_mode == EGRESS_PROXY else None
     print(
         f"开始初始化 Scrapling 会话... 账号={account_index + 1}, "
         f"出口={describe_egress_mode(egress_mode)}, state={account_state_dir}"
     )
-    if proxy:
-        print(f"🌐 浏览器业务流量将通过代理: {mask_proxy_url(proxy)}")
-    else:
-        print("🌐 浏览器业务流量将直连")
 
-    if use_custom_fingerprint and config.user_agent:
-        print("🧪 已启用自定义 User-Agent")
-    if use_custom_fingerprint and config.extra_headers:
-        print(f"🧪 附加请求头: {', '.join(sorted(config.extra_headers))}")
-    if not use_custom_fingerprint:
-        print("🧪 认证流已切换为浏览器原生指纹，忽略自定义 UA / Headers")
+    browser_proxy: str | None = None
+    proxy_runtime: BrowserProxyRuntime | None = None
+    try:
+        browser_proxy, proxy_runtime = prepare_browser_proxy(egress_mode)
 
-    additional_args: dict[str, Any] | None = None
-    if should_ignore_proxy_tls_errors(egress_mode, proxy):
-        additional_args = {"ignore_https_errors": True}
-        print("🧪 已为 HTTPS 代理启用证书忽略（NS_PROXY_INSECURE=true）")
-    elif egress_mode == EGRESS_PROXY and is_https_proxy_url(proxy or ""):
-        print(f"🔒 当前 HTTPS 代理将严格校验证书（NS_PROXY_INSECURE={config.proxy_insecure}）")
+        if use_custom_fingerprint and config.user_agent:
+            print("🧪 已启用自定义 User-Agent")
+        if use_custom_fingerprint and config.extra_headers:
+            print(f"🧪 附加请求头: {', '.join(sorted(config.extra_headers))}")
+        if not use_custom_fingerprint:
+            print("🧪 认证流已切换为浏览器原生指纹，忽略自定义 UA / Headers")
 
-    return StealthySession(
-        headless=config.headless,
-        solve_cloudflare=solve_cloudflare_enabled(),
-        user_data_dir=str(account_state_dir.resolve()),
-        network_idle=True,
-        timeout=browser_timeout_ms(),
-        google_search=False,
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
-        proxy=proxy,
-        load_dom=True,
-        useragent=config.user_agent if use_custom_fingerprint else None,
-        extra_headers=(config.extra_headers or None) if use_custom_fingerprint else None,
-        additional_args=additional_args,
-    )
+        session = StealthySession(
+            headless=config.headless,
+            solve_cloudflare=solve_cloudflare_enabled(),
+            user_data_dir=str(account_state_dir.resolve()),
+            network_idle=True,
+            timeout=browser_timeout_ms(),
+            google_search=False,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            proxy=browser_proxy,
+            load_dom=True,
+            useragent=config.user_agent if use_custom_fingerprint else None,
+            extra_headers=(config.extra_headers or None) if use_custom_fingerprint else None,
+        )
+        return ManagedStealthSession(session, proxy_runtime)
+    except Exception:
+        if proxy_runtime is not None:
+            proxy_runtime.stop()
+        raise
 
 
 def bootstrap_session(

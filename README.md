@@ -100,7 +100,7 @@ session=abc123xyz; token=def456uvw; user_id=12345
 - `NS_PROXY_INSECURE`
   - 默认 `true`
   - 仅在 `NS_PROXY_URL` 为 `https://...` 且当前出口走代理时生效
-  - `true` 表示忽略 HTTPS 代理这一跳的证书校验，不会关闭 NodeSeek 站点本身的 HTTPS 校验
+  - `true` 表示只跳过“脚本连接上游 HTTPS 代理”这一跳的证书校验，不会关闭 NodeSeek 站点本身的 HTTPS 校验
 - `NS_SKIP_COMMENTS`
   - 默认 `false`
   - 设为 `true` 时只做登录态校验 + 签到，跳过评论流程
@@ -127,8 +127,9 @@ session=abc123xyz; token=def456uvw; user_id=12345
 
 - 代理只影响 NodeSeek 浏览器动作，不影响 Telegram 通知
 - 如果目标是让 GitHub Hosted 无人值守跑通真实登录，建议 `NS_PROXY_URL` 使用支持 sticky session 的住宅 / 移动代理
-- 当 `NS_PROXY_URL` 为 `https://...` 时，可用 `NS_PROXY_INSECURE=true` 忽略代理证书校验；这只影响浏览器连接代理这一跳
-- 如果 `NS_PROXY_INSECURE=false`，Chromium 会严格校验 HTTPS 代理证书；证书无效时可能在首页引导阶段直接报 `ERR_PROXY_CERTIFICATE_INVALID`
+- 当 `NS_PROXY_URL` 为 `https://...`，或代理地址里带用户名密码时，脚本会先启动一个本地 HTTP 代理桥；浏览器只连本地桥，桥再去连上游代理
+- `NS_PROXY_INSECURE=true` 只影响“脚本连接上游 HTTPS 代理”这一跳；不会关闭浏览器对 NodeSeek 本站 HTTPS 的校验
+- 如果 `NS_PROXY_INSECURE=false`，脚本会严格校验上游 HTTPS 代理证书；像 IP 直连这类 SAN 不匹配代理，可能在初始化阶段直接失败
 - `NS_EGRESS_MODE=auto` 时：
   - 有 `NS_PROXY_URL`：先走代理，再在可重试失败时切直连
   - 无 `NS_PROXY_URL`：直接走直连
