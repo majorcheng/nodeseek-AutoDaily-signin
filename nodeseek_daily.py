@@ -150,6 +150,7 @@ class Config:
     egress_mode: str
     cf_wait_seconds: int
     cf_login_retries: int
+    proxy_insecure: bool
     skip_comments: bool
     browser_state_dir: str
     user_agent: str | None
@@ -203,6 +204,7 @@ class Config:
             egress_mode=egress_mode,
             cf_wait_seconds=max(0, int_from_source("NS_CF_WAIT_SECONDS", 30)),
             cf_login_retries=max(1, int_from_source("NS_CF_LOGIN_RETRIES", 2)),
+            proxy_insecure=bool_from_source("NS_PROXY_INSECURE", True),
             skip_comments=bool_from_source("NS_SKIP_COMMENTS", False),
             browser_state_dir=((source.get("NS_BROWSER_STATE_DIR", ".browser-state") or ".browser-state").strip() or ".browser-state"),
             user_agent=(source.get("NS_USER_AGENT", "") or "").strip() or None,
@@ -339,6 +341,37 @@ def build_attempt_result(status_code: str, reason: str | None = None, egress_mod
         "reason": reason,
         "egress_mode": egress_mode,
     }
+
+
+def is_https_proxy_url(proxy_url: str) -> bool:
+    if not proxy_url:
+        return False
+    try:
+        return (urlparse(proxy_url).scheme or "").lower() == "https"
+    except Exception:
+        return False
+
+
+def should_ignore_proxy_tls_errors(egress_mode: str, proxy_url: str | None = None) -> bool:
+    if egress_mode != EGRESS_PROXY:
+        return False
+    upstream_proxy = proxy_url if proxy_url is not None else config.proxy_url
+    return bool(config.proxy_insecure and is_https_proxy_url(upstream_proxy or ""))
+
+
+def build_proxy_failure_reason(exc: Exception, egress_mode: str) -> str:
+    reason = f"浏览器初始化或首页引导失败: {exc}"
+    if "ERR_PROXY_CERTIFICATE_INVALID" not in str(exc):
+        return reason
+
+    proxy_label = mask_proxy_url(config.proxy_url)
+    if egress_mode != EGRESS_PROXY:
+        return f"{reason}（检测到代理证书错误，但当前出口不是代理；代理={proxy_label}）"
+    if not is_https_proxy_url(config.proxy_url):
+        return f"{reason}（当前代理不是 HTTPS 代理；代理={proxy_label}）"
+    if config.proxy_insecure:
+        return f"{reason}（已启用 NS_PROXY_INSECURE=true，但代理证书仍不被 Chromium 接受；代理={proxy_label}）"
+    return f"{reason}（当前为 HTTPS 代理，且 NS_PROXY_INSECURE=false；可改用有效证书代理，或显式开启 NS_PROXY_INSECURE；代理={proxy_label}）"
 
 
 def mask_proxy_url(proxy_url: str) -> str:
@@ -819,6 +852,15 @@ def create_session(
     if not use_custom_fingerprint:
         print("🧪 认证流已切换为浏览器原生指纹，忽略自定义 UA / Headers")
 
+    additional_args: dict[str, Any] | None = None
+    extra_flags: list[str] | None = None
+    if should_ignore_proxy_tls_errors(egress_mode, proxy):
+        additional_args = {"ignore_https_errors": True}
+        extra_flags = ["--ignore-certificate-errors"]
+        print("🧪 已为 HTTPS 代理启用证书忽略（NS_PROXY_INSECURE=true）")
+    elif egress_mode == EGRESS_PROXY and is_https_proxy_url(proxy or ""):
+        print(f"🔒 当前 HTTPS 代理将严格校验证书（NS_PROXY_INSECURE={config.proxy_insecure}）")
+
     return StealthySession(
         headless=config.headless,
         solve_cloudflare=solve_cloudflare_enabled(),
@@ -832,6 +874,8 @@ def create_session(
         load_dom=True,
         useragent=config.user_agent if use_custom_fingerprint else None,
         extra_headers=(config.extra_headers or None) if use_custom_fingerprint else None,
+        additional_args=additional_args,
+        extra_flags=extra_flags,
     )
 
 
@@ -867,7 +911,7 @@ def bootstrap_session(
             load_dom=True,
         )
     except Exception as exc:
-        reason = f"浏览器初始化或首页引导失败: {exc}"
+        reason = build_proxy_failure_reason(exc, egress_mode)
         print(reason)
         print(traceback.format_exc())
         return snapshot, build_attempt_result(LOGIN_STATUS_EGRESS_FAILED, reason, egress_mode)
@@ -1850,7 +1894,7 @@ def main() -> int:
     print("开始执行 NodeSeek 自动任务（Scrapling 版）...")
     print(
         f"当前配置: NS_RANDOM={config.ns_random}, NS_HEADLESS={config.headless}, "
-        f"PROXY={mask_proxy_url(config.proxy_url)}, EGRESS_MODE={config.egress_mode}, "
+        f"PROXY={mask_proxy_url(config.proxy_url)}, PROXY_INSECURE={config.proxy_insecure}, EGRESS_MODE={config.egress_mode}, "
         f"CF_WAIT={config.cf_wait_seconds}s, CF_LOGIN_RETRIES={config.cf_login_retries}, "
         f"SKIP_COMMENTS={config.skip_comments}, STATE_DIR={config.browser_state_dir}"
     )

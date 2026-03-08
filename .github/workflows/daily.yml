@@ -41,6 +41,7 @@ jobs:
           NS_RANDOM: ${{ secrets.NS_RANDOM }}
           NS_COMMENT_URL: ${{ secrets.NS_COMMENT_URL }}
           NS_PROXY_URL: ${{ secrets.NS_PROXY_URL }}
+          NS_PROXY_INSECURE: ${{ vars.NS_PROXY_INSECURE }}
           NS_USERNAME: ${{ secrets.NS_USERNAME }}
           NS_PASSWORD: ${{ secrets.NS_PASSWORD }}
           NS_EGRESS_MODE: ${{ vars.NS_EGRESS_MODE }}

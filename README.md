@@ -97,6 +97,10 @@ session=abc123xyz; token=def456uvw; user_id=12345
 - `NS_HEADLESS`
   - 默认 `true`
   - 是否使用无头浏览器
+- `NS_PROXY_INSECURE`
+  - 默认 `true`
+  - 仅在 `NS_PROXY_URL` 为 `https://...` 且当前出口走代理时生效
+  - `true` 表示忽略 HTTPS 代理这一跳的证书校验，不会关闭 NodeSeek 站点本身的 HTTPS 校验
 - `NS_SKIP_COMMENTS`
   - 默认 `false`
   - 设为 `true` 时只做登录态校验 + 签到，跳过评论流程
@@ -123,10 +127,12 @@ session=abc123xyz; token=def456uvw; user_id=12345
 
 - 代理只影响 NodeSeek 浏览器动作，不影响 Telegram 通知
 - 如果目标是让 GitHub Hosted 无人值守跑通真实登录，建议 `NS_PROXY_URL` 使用支持 sticky session 的住宅 / 移动代理
+- 当 `NS_PROXY_URL` 为 `https://...` 时，可用 `NS_PROXY_INSECURE=true` 忽略代理证书校验；这只影响浏览器连接代理这一跳
+- 如果 `NS_PROXY_INSECURE=false`，Chromium 会严格校验 HTTPS 代理证书；证书无效时可能在首页引导阶段直接报 `ERR_PROXY_CERTIFICATE_INVALID`
 - `NS_EGRESS_MODE=auto` 时：
   - 有 `NS_PROXY_URL`：先走代理，再在可重试失败时切直连
   - 无 `NS_PROXY_URL`：直接走直连
-- 当前脚本只会在 `cf_challenge` 或启动失败时切换到下一个出口
+- 当前脚本只会在 `cf_challenge` 或启动失败时切换到下一个出口；`ERR_PROXY_CERTIFICATE_INVALID` 仍归类为启动失败，会继续触发 `auto` 模式兜底
 - 浏览器状态缓存保存在 `NS_BROWSER_STATE_DIR` 下：
   - `account-1/`
   - `account-2/`
