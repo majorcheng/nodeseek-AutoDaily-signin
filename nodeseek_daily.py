@@ -853,10 +853,8 @@ def create_session(
         print("🧪 认证流已切换为浏览器原生指纹，忽略自定义 UA / Headers")
 
     additional_args: dict[str, Any] | None = None
-    extra_flags: list[str] | None = None
     if should_ignore_proxy_tls_errors(egress_mode, proxy):
         additional_args = {"ignore_https_errors": True}
-        extra_flags = ["--ignore-certificate-errors"]
         print("🧪 已为 HTTPS 代理启用证书忽略（NS_PROXY_INSECURE=true）")
     elif egress_mode == EGRESS_PROXY and is_https_proxy_url(proxy or ""):
         print(f"🔒 当前 HTTPS 代理将严格校验证书（NS_PROXY_INSECURE={config.proxy_insecure}）")
@@ -875,7 +873,6 @@ def create_session(
         useragent=config.user_agent if use_custom_fingerprint else None,
         extra_headers=(config.extra_headers or None) if use_custom_fingerprint else None,
         additional_args=additional_args,
-        extra_flags=extra_flags,
     )
 
 
