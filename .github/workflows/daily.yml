@@ -11,30 +11,38 @@ on:
 jobs:
   run-nodeseek-daily:
     runs-on: ubuntu-22.04
+    env:
+      NS_CHROME_PROFILE_DIR: ${{ vars.NS_CHROME_PROFILE_DIR || '.chrome-profile' }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-      
+        uses: actions/checkout@v4
+
+      - name: Restore Chrome profile cache
+        id: restore-chrome-profile
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.NS_CHROME_PROFILE_DIR }}
+          key: nodeseek-profile-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            nodeseek-profile-${{ runner.os }}-${{ github.ref_name }}-
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install Chrome and dependencies
         run: |
-          # 安装依赖
           sudo apt-get update
           sudo apt-get install -y wget gnupg xvfb
-          
-          # 添加 Google Chrome 官方源
+
           wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
           echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          
-          # 安装稳定版 Chrome
+
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
-          
+
           echo "Chrome version:"
           google-chrome --version
 
@@ -52,10 +60,33 @@ jobs:
           NS_COMMENT_URL: ${{ secrets.NS_COMMENT_URL }}
           NS_PROXY_URL: ${{ secrets.NS_PROXY_URL }}
           NS_PROXY_INSECURE: ${{ vars.NS_PROXY_INSECURE }}
+          NS_EGRESS_MODE: ${{ vars.NS_EGRESS_MODE }}
+          NS_CF_WAIT_SECONDS: ${{ vars.NS_CF_WAIT_SECONDS }}
           NS_DELAY_MIN: ${{ vars.NS_DELAY_MIN }}
           NS_DELAY_MAX: ${{ vars.NS_DELAY_MAX }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          HEADLESS: "true"
+          HEADLESS: "false"
         run: |
           xvfb-run --auto-servernum python nodeseek_daily.py
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodeseek-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            login_check_failed.png
+            cf_block_sign.png
+            sign_intro_error.png
+            sign_exception.png
+            comment_main_error.png
+            comment_error_*.png
+
+      - name: Save Chrome profile cache
+        if: always() && hashFiles(format('{0}/.ns_profile_ok', env.NS_CHROME_PROFILE_DIR)) != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.NS_CHROME_PROFILE_DIR }}
+          key: nodeseek-profile-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}

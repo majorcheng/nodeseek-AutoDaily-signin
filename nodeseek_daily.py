@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -64,6 +65,15 @@ class Config:
         self.proxy_url = proxy_url_env.strip()
         proxy_insecure_env = os.environ.get("NS_PROXY_INSECURE", "true") or "true"
         self.proxy_insecure = proxy_insecure_env.strip().lower() == "true"
+        egress_mode_env = os.environ.get("NS_EGRESS_MODE", "auto") or "auto"
+        self.egress_mode = egress_mode_env.strip().lower() or "auto"
+        if self.egress_mode not in {"auto", "proxy", "direct"}:
+            self.egress_mode = "auto"
+
+        cf_wait_env = os.environ.get("NS_CF_WAIT_SECONDS", "30") or "30"
+        self.cf_wait_seconds = max(0, int(cf_wait_env))
+        profile_dir_env = os.environ.get("NS_CHROME_PROFILE_DIR", ".chrome-profile") or ".chrome-profile"
+        self.chrome_profile_dir = profile_dir_env.strip() or ".chrome-profile"
     
     @property
     def account_count(self):
@@ -85,6 +95,153 @@ config = Config()
 
 # 随机评论内容
 randomInputStr = ["bd","绑定","帮顶",":xhj007: BD","好价","过来看一下"," :xhj025: 嚯","咕噜咕噜","可以","  :xhj003: 可以","还可以","楼下"," :xhj010: 顶","bd一下"," :xhj027: 哦"]
+
+EGRESS_PROXY = "proxy"
+EGRESS_DIRECT = "direct"
+LOGIN_STATUS_OK = "ok"
+LOGIN_STATUS_CF_CHALLENGE = "cf_challenge"
+LOGIN_STATUS_LOGIN_PAGE = "login_page"
+LOGIN_STATUS_COOKIE_INVALID = "cookie_invalid"
+LOGIN_STATUS_UNKNOWN_PAGE = "unknown_page"
+LOGIN_STATUS_EGRESS_FAILED = "egress_failed"
+PROFILE_SUCCESS_MARKER = ".ns_profile_ok"
+
+
+def get_profile_root_dir():
+    return Path(config.chrome_profile_dir)
+
+
+def build_profile_dir(account_index):
+    return get_profile_root_dir() / f"account-{account_index + 1}"
+
+
+def get_profile_success_marker_path():
+    return get_profile_root_dir() / PROFILE_SUCCESS_MARKER
+
+
+def clear_profile_success_marker():
+    marker_path = get_profile_success_marker_path()
+    try:
+        marker_path.unlink(missing_ok=True)
+    except TypeError:
+        if marker_path.exists():
+            marker_path.unlink()
+
+
+def mark_profile_success():
+    marker_path = get_profile_success_marker_path()
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text("ok\n", encoding="utf-8")
+
+
+def build_attempt_result(status_code, reason=None, egress_mode=None):
+    return {
+        "status_code": status_code,
+        "reason": reason,
+        "egress_mode": egress_mode,
+    }
+
+
+def is_cloudflare_challenge_page(driver):
+    try:
+        title = (driver.title or "").strip()
+    except Exception:
+        title = ""
+
+    if "Just a moment" in title or "Attention Required" in title:
+        return True
+
+    try:
+        body_text = driver.find_element(By.TAG_NAME, 'body').text
+    except Exception:
+        body_text = ""
+
+    challenge_keywords = [
+        "Performing security verification",
+        "This website uses a security service",
+        "verifies you are not a bot",
+        "Cloudflare",
+    ]
+    return any(keyword in body_text for keyword in challenge_keywords)
+
+
+def wait_for_cloudflare_clearance(driver, wait_seconds):
+    if wait_seconds <= 0:
+        if is_cloudflare_challenge_page(driver):
+            return False, "未等待，仍停留在 Cloudflare 挑战页"
+        return True, None
+
+    deadline = time.time() + wait_seconds
+    last_title = ""
+    while time.time() <= deadline:
+        if not is_cloudflare_challenge_page(driver):
+            return True, None
+
+        try:
+            current_title = driver.title or ""
+        except Exception:
+            current_title = ""
+
+        if current_title != last_title:
+            print(f"⏳ 等待 Cloudflare 挑战完成中... 当前标题: {current_title}")
+            last_title = current_title
+        time.sleep(2)
+
+    return False, f"等待 {wait_seconds} 秒后仍停留在 Cloudflare 挑战页"
+
+
+def build_egress_candidates():
+    if config.egress_mode == EGRESS_PROXY:
+        return [EGRESS_PROXY]
+    if config.egress_mode == EGRESS_DIRECT:
+        return [EGRESS_DIRECT]
+    if config.proxy_url:
+        return [EGRESS_PROXY, EGRESS_DIRECT]
+    return [EGRESS_DIRECT]
+
+
+def should_retry_with_next_egress(status_code):
+    return status_code in {LOGIN_STATUS_CF_CHALLENGE, LOGIN_STATUS_EGRESS_FAILED}
+
+
+def describe_egress_mode(egress_mode):
+    return "代理" if egress_mode == EGRESS_PROXY else "直连"
+
+
+def build_stealth_script():
+    return """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en-US', 'en']});
+Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+  window.navigator.permissions.query = (parameters) => (
+    parameters && parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters)
+  );
+}
+if (typeof WebGLRenderingContext !== 'undefined') {
+  const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+    return originalGetParameter.call(this, parameter);
+  };
+}
+if (typeof WebGL2RenderingContext !== 'undefined') {
+  const originalGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
+  WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+    return originalGetParameter2.call(this, parameter);
+  };
+}
+"""
 
 
 def mask_proxy_url(proxy_url):
@@ -369,22 +526,20 @@ class BrowserProxyRuntime:
                 target_sock.sendall(payload)
 
 
-def build_browser_proxy_runtime():
-    """按配置初始化浏览器代理；失败时自动回退直连"""
-    if not config.proxy_url:
-        print("🌐 未配置 NS_PROXY_URL，浏览器业务流量将直连")
+def build_browser_proxy_runtime(egress_mode):
+    """按指定出口初始化浏览器代理；失败时抛出异常，由上层决定是否切换出口"""
+    if egress_mode == EGRESS_DIRECT:
+        print("🌐 当前出口: 直连")
         return None
 
-    try:
-        runtime = BrowserProxyRuntime(config.proxy_url, config.proxy_insecure)
-        runtime.start()
-        return runtime
-    except Exception as exc:
-        print(
-            "⚠️ 浏览器代理初始化失败，将自动回退直连: "
-            f"{mask_proxy_url(config.proxy_url)} | 错误: {str(exc)}"
-        )
-        return None
+    if not config.proxy_url:
+        raise RuntimeError("当前出口模式要求代理，但未配置 NS_PROXY_URL")
+
+    print(f"🌐 当前出口: 代理 {mask_proxy_url(config.proxy_url)}")
+    runtime = BrowserProxyRuntime(config.proxy_url, config.proxy_insecure)
+    runtime.start()
+    return runtime
+
 
 def send_telegram_message(message):
     """
@@ -516,42 +671,47 @@ def capture_login_diagnostics(driver, reason):
 def check_login_status(driver):
     """
     检测 Cookie 是否有效（用户是否已登录）
-    返回: (True, None) 表示已登录；(False, reason) 表示未登录或遭遇风控
+    返回: (status_code, reason)
     """
     try:
         print("正在检测登录状态...")
-        current_title = driver.title or ''
-        if 'Just a moment' in current_title or 'Attention Required' in current_title:
+        current_url = driver.current_url or ''
+
+        if is_cloudflare_challenge_page(driver):
             reason = '登录检测阶段遭遇 Cloudflare/风控页'
             capture_login_diagnostics(driver, reason)
-            return False, reason
+            return LOGIN_STATUS_CF_CHALLENGE, reason
 
-        # 尝试查找用户头像或用户相关元素
         user_elements = driver.find_elements(By.CSS_SELECTOR, '.avatar, .nsk-user-avatar, [class*="avatar"]')
-
-        # 也检查是否存在登录按钮（未登录时会显示）
         login_buttons = driver.find_elements(By.XPATH, "//span[contains(text(), '登录')]")
 
         if len(user_elements) > 0 and len(login_buttons) == 0:
             print("✅ 登录状态有效")
-            return True, None
+            return LOGIN_STATUS_OK, None
 
         try:
             page_text = driver.find_element(By.TAG_NAME, 'body').text
         except Exception:
             page_text = ''
 
-        if '登录' in page_text and '注册' in page_text and '个人中心' not in page_text:
-            reason = '落到登录页，Cookie 可能无效'
-        else:
-            reason = '未识别到登录态，可能是风控、页面结构变动或 Cookie domain 不匹配'
+        if '/login' in current_url:
+            reason = '跳转到了登录页，Cookie 可能失效'
+            capture_login_diagnostics(driver, reason)
+            return LOGIN_STATUS_LOGIN_PAGE, reason
 
+        if '登录' in page_text and '注册' in page_text and '个人中心' not in page_text:
+            reason = '页面出现登录/注册提示，Cookie 可能失效'
+            capture_login_diagnostics(driver, reason)
+            return LOGIN_STATUS_COOKIE_INVALID, reason
+
+        reason = '未识别到登录态，可能是风控、页面结构变化或 Cookie domain 不匹配'
         capture_login_diagnostics(driver, reason)
-        return False, reason
+        return LOGIN_STATUS_UNKNOWN_PAGE, reason
     except Exception as e:
         reason = f'检测登录状态时出错: {str(e)}'
         print(reason)
-        return False, reason
+        return LOGIN_STATUS_UNKNOWN_PAGE, reason
+
 
 def _parse_reward_from_text(text):
     """从文本中解析鸡腿数量"""
@@ -604,12 +764,16 @@ def click_sign_icon(driver):
         print(f"当前页面URL: {current_url}")
         
         # 0. 检查 Cloudflare
-        if "Just a moment" in driver.title or "Attention Required" in driver.title:
-            print("❌ 检测到 Cloudflare 拦截")
-            driver.save_screenshot("cf_block_sign.png")
-            send_telegram_photo("cf_block_sign.png", caption="❌ 签到时遭遇 Cloudflare 拦截")
-            return "failed", "Cloudflare 拦截"
-            
+        if is_cloudflare_challenge_page(driver):
+            wait_ok, wait_reason = wait_for_cloudflare_clearance(driver, config.cf_wait_seconds)
+            if not wait_ok:
+                print(f"❌ 检测到 Cloudflare 拦截: {wait_reason}")
+                driver.save_screenshot("cf_block_sign.png")
+                send_telegram_photo("cf_block_sign.png", caption=f"❌ 签到时遭遇 Cloudflare 拦截\n{wait_reason}")
+                return "failed", "Cloudflare 拦截"
+            current_url = driver.current_url
+            print(f"挑战结束后当前URL: {current_url}")
+
         # 1. 检查是否被重定向回首页
         if "/board" not in current_url and "nodeseek.com" in current_url and len(current_url) < 30:
             print("⚠️ 似乎跳转回了首页，尝试在首页寻找签到入口...")
@@ -758,83 +922,88 @@ def click_sign_icon(driver):
             pass
         return "failed", f"异常: {str(e)}"
 
-def setup_driver_and_cookies(cookie_str):
+def setup_driver_and_cookies(cookie_str, account_index, egress_mode):
     """
-    初始化浏览器并设置cookie的通用方法
-    :param cookie_str: Cookie 字符串
-    返回: (设置好cookie的driver实例, 代理运行时)
+    初始化浏览器并设置 Cookie
+    返回: (driver, proxy_runtime, attempt_result)
     """
     proxy_runtime = None
     driver = None
+    attempt_result = build_attempt_result(LOGIN_STATUS_EGRESS_FAILED, '浏览器初始化失败', egress_mode)
     try:
         if not cookie_str:
-            print("未找到cookie配置")
-            return None, None
-            
-        print("开始初始化浏览器...")
+            reason = '未找到 cookie 配置'
+            print(reason)
+            return None, None, build_attempt_result(LOGIN_STATUS_COOKIE_INVALID, reason, egress_mode)
+
+        profile_dir = build_profile_dir(account_index)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"开始初始化浏览器... 账号={account_index + 1}, 出口={describe_egress_mode(egress_mode)}")
+        print(f"浏览器 profile 目录: {profile_dir}")
         options = Options()
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
         options.add_argument('--disable-software-rasterizer')
-        
-        if config.headless:
-            print("启用无头模式...")
-            options.add_argument('--headless=new')
-            options.add_argument('--window-size=1920,1080')
-            # 更新为较新的 User-Agent (Chrome 122)
-            options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
-        
-        # 禁用自动化控制标记
         options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument('--lang=zh-CN')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+        options.add_argument(f'--user-data-dir={profile_dir.resolve()}')
         options.add_experimental_option('excludeSwitches', ['enable-automation'])
         options.add_experimental_option('useAutomationExtension', False)
 
-        # 仅对浏览器业务流量挂代理，不改动全局网络环境
-        proxy_runtime = build_browser_proxy_runtime()
+        if config.headless:
+            print('启用无头模式...')
+            options.add_argument('--headless=new')
+        else:
+            print('启用有头模式（通过 xvfb 提供虚拟显示）...')
+
+        proxy_runtime = build_browser_proxy_runtime(egress_mode)
         if proxy_runtime and proxy_runtime.browser_proxy_url:
             options.add_argument(f"--proxy-server={proxy_runtime.browser_proxy_url}")
-        
-        print("正在启动Chrome...")
-        # 使用 webdriver-manager 自动管理 ChromeDriver 版本
+
+        print('正在启动 Chrome...')
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        
-        # 修改 webdriver 标记
         driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            'source': build_stealth_script()
         })
-        
-        if config.headless:
-            driver.set_window_size(1920, 1080)
-        
-        print("Chrome启动成功")
-        
-        print("正在设置cookie...")
+
+        driver.set_window_size(1920, 1080)
+        print('Chrome 启动成功')
+
+        print('正在访问首页并注入 Cookie...')
         driver.get('https://www.nodeseek.com')
-        
-        # 等待页面加载完成
         time.sleep(5)
-        print("Cookie 域名策略: cf_clearance -> .nodeseek.com，其余 Cookie -> 当前主机 www.nodeseek.com")
-        
+        print('Cookie 域名策略: cf_clearance -> .nodeseek.com，其余 Cookie -> 当前主机 www.nodeseek.com')
+
         for cookie_item in cookie_str.split(';'):
             try:
                 name, value = cookie_item.strip().split('=', 1)
                 cookie_payload = build_cookie_payload(name.strip(), value.strip())
                 driver.add_cookie(cookie_payload)
             except Exception as e:
-                print(f"设置cookie出错: {name if 'name' in locals() else '<unknown>'} | {str(e)}")
+                print(f"设置 Cookie 出错: {name if 'name' in locals() else '<unknown>'} | {str(e)}")
                 continue
-        
-        print("刷新页面...")
+
+        print('刷新页面...')
         driver.refresh()
-        time.sleep(5)  # 增加等待时间
-        
-        return driver, proxy_runtime
-        
+        time.sleep(3)
+        wait_ok, wait_reason = wait_for_cloudflare_clearance(driver, config.cf_wait_seconds)
+        if not wait_ok:
+            capture_login_diagnostics(driver, wait_reason)
+            attempt_result = build_attempt_result(LOGIN_STATUS_CF_CHALLENGE, wait_reason, egress_mode)
+            return driver, proxy_runtime, attempt_result
+
+        attempt_result = build_attempt_result(LOGIN_STATUS_OK, None, egress_mode)
+        return driver, proxy_runtime, attempt_result
+
     except Exception as e:
-        print(f"设置浏览器和Cookie时出错: {str(e)}")
-        print("详细错误信息:")
+        reason = f'浏览器初始化或首页引导失败: {str(e)}'
+        print(reason)
+        print('详细错误信息:')
         print(traceback.format_exc())
         if driver:
             try:
@@ -843,7 +1012,8 @@ def setup_driver_and_cookies(cookie_str):
                 pass
         if proxy_runtime:
             proxy_runtime.stop()
-        return None, None
+        return None, None, build_attempt_result(LOGIN_STATUS_EGRESS_FAILED, reason, egress_mode)
+
 
 def nodeseek_comment(driver):
     """执行评论任务，返回成功评论数量"""
@@ -888,7 +1058,14 @@ def nodeseek_comment(driver):
                 time.sleep(3)  # 增加等待时间确保页面完全加载
                 
                 # 检查页面是否正常加载
-                if "Just a moment" in driver.title or "error" in driver.title.lower():
+                if is_cloudflare_challenge_page(driver):
+                    wait_ok, wait_reason = wait_for_cloudflare_clearance(driver, config.cf_wait_seconds)
+                    if not wait_ok:
+                        print(f"⚠️ 页面加载遭遇 Cloudflare，跳过此帖子: {wait_reason}")
+                        consecutive_failures += 1
+                        continue
+
+                if "error" in driver.title.lower():
                     print(f"⚠️ 页面加载异常，跳过此帖子")
                     consecutive_failures += 1
                     continue
@@ -988,41 +1165,75 @@ def run_for_account(cookie_str, account_index):
         "sign_in": "failed",
         "reward": "0",
         "comments": 0,
-        "error": None
+        "error": None,
+        "egress_mode": None,
+        "failure_class": None,
     }
-    
+
     print(f"\n{'='*50}")
     print(f"开始处理账号 {account_index + 1}")
     print(f"{'='*50}")
-    
-    driver, proxy_runtime = setup_driver_and_cookies(cookie_str)
-    if not driver:
-        result["error"] = "浏览器初始化失败"
-        return result
-    
-    try:
-        # 检测登录状态
-        login_ok, login_reason = check_login_status(driver)
-        if not login_ok:
-            result["error"] = login_reason or "Cookie 已过期"
-            return result
-        
-        # 执行签到任务
-        status, reward = click_sign_icon(driver)
-        result["sign_in"] = status
-        result["reward"] = reward
-        
-        # 执行评论任务
-        result["comments"] = nodeseek_comment(driver)
-        
-    finally:
+
+    egress_candidates = build_egress_candidates()
+    last_attempt = build_attempt_result(LOGIN_STATUS_UNKNOWN_PAGE, '未开始尝试', None)
+
+    for attempt_index, egress_mode in enumerate(egress_candidates, start=1):
+        driver = None
+        proxy_runtime = None
+        print(f"🚀 第 {attempt_index}/{len(egress_candidates)} 次尝试，出口={describe_egress_mode(egress_mode)}")
         try:
-            driver.quit()
-        except:
-            pass
-        if proxy_runtime:
-            proxy_runtime.stop()
-    
+            driver, proxy_runtime, bootstrap_result = setup_driver_and_cookies(cookie_str, account_index, egress_mode)
+            result['egress_mode'] = egress_mode
+            result['failure_class'] = bootstrap_result['status_code']
+            last_attempt = bootstrap_result
+
+            if not driver:
+                result['error'] = bootstrap_result['reason'] or '浏览器初始化失败'
+                if should_retry_with_next_egress(bootstrap_result['status_code']) and attempt_index < len(egress_candidates):
+                    print('⚠️ 当前出口初始化失败，准备切换到下一个出口重试')
+                    continue
+                return result
+
+            if bootstrap_result['status_code'] != LOGIN_STATUS_OK:
+                result['error'] = bootstrap_result['reason'] or '首页引导失败'
+                if should_retry_with_next_egress(bootstrap_result['status_code']) and attempt_index < len(egress_candidates):
+                    print('⚠️ 首页引导阶段命中可重试失败，准备切换出口重试')
+                    continue
+                return result
+
+            login_status, login_reason = check_login_status(driver)
+            result['failure_class'] = login_status
+            if login_status != LOGIN_STATUS_OK:
+                result['error'] = login_reason or '登录状态异常'
+                if should_retry_with_next_egress(login_status) and attempt_index < len(egress_candidates):
+                    print('⚠️ 登录检测阶段命中可重试失败，准备切换出口重试')
+                    continue
+                return result
+
+            mark_profile_success()
+            result['failure_class'] = None
+            result['error'] = None
+
+            status, reward = click_sign_icon(driver)
+            result['sign_in'] = status
+            result['reward'] = reward
+            if status in ('success', 'already'):
+                mark_profile_success()
+
+            result['comments'] = nodeseek_comment(driver)
+            return result
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            if proxy_runtime:
+                proxy_runtime.stop()
+
+    result['error'] = last_attempt['reason'] or '所有出口均尝试失败'
+    result['failure_class'] = last_attempt['status_code']
+    result['egress_mode'] = last_attempt['egress_mode']
     return result
 
 
@@ -1032,8 +1243,10 @@ if __name__ == "__main__":
     # 检查配置
     print(
         f"当前配置: NS_RANDOM={config.ns_random}, HEADLESS={config.headless}, "
-        f"PROXY={mask_proxy_url(config.proxy_url)}"
+        f"PROXY={mask_proxy_url(config.proxy_url)}, EGRESS_MODE={config.egress_mode}, "
+        f"CF_WAIT={config.cf_wait_seconds}s, PROFILE_DIR={config.chrome_profile_dir}"
     )
+    clear_profile_success_marker()
     if config.account_count == 0:
         print("未配置 Cookie，退出")
         send_telegram_message("❌ <b>NodeSeek 自动任务失败</b>\n\n未配置 NS_COOKIE 环境变量")
@@ -1067,10 +1280,14 @@ if __name__ == "__main__":
         # 单账号汇报
         r = all_results[0]
         if r["error"]:
+            egress_label = describe_egress_mode(r["egress_mode"]) if r["egress_mode"] else '未知'
+            failure_label = r['failure_class'] or 'unknown'
             report_message = f"""<b>NodeSeek 每日简报</b>
 ━━━━━━━━━━━━━━━
 ❌ <b>任务失败</b>
 ━━━━━━━━━━━━━━━
+🌐 <b>出口</b>: {egress_label}
+🧭 <b>分类</b>: {failure_label}
 ⚠️ <b>错误</b>: {r["error"]}
 🕒 {beijing_time}"""
         else:
@@ -1084,9 +1301,11 @@ if __name__ == "__main__":
                 sign_status = "❌ 失败"
                 sign_result = "签到失败"
                 
+            egress_label = describe_egress_mode(r["egress_mode"]) if r["egress_mode"] else '未知'
             report_message = f"""<b>NodeSeek 每日简报</b>
 ━━━━━━━━━━━━━━━
 👤 <b>账号</b>: 账号 1
+🌐 <b>出口</b>: {egress_label}
 🏆 <b>奖励</b>: <b>{r["reward"]}</b> 🍗
 💬 <b>评论</b>: {r["comments"]} 条
 ━━━━━━━━━━━━━━━
@@ -1097,13 +1316,16 @@ if __name__ == "__main__":
         account_lines = []
         for i, r in enumerate(all_results):
             if r["error"]:
-                account_lines.append(f"\u274c \u8d26\u53f7{i+1}: {r['error']}")
+                egress_label = describe_egress_mode(r['egress_mode']) if r['egress_mode'] else '未知'
+                failure_label = r['failure_class'] or 'unknown'
+                account_lines.append(f"\u274c \u8d26\u53f7{i+1}: {egress_label} | {failure_label} | {r['error']}")
             else:
                 if r["sign_in"] in ("success", "already"):
                     sign = f"\u2705 +{r['reward']}\ud83c\udf57"
                 else:
                     sign = "\u274c"
-                account_lines.append(f"\ud83d\udc64 \u8d26\u53f7{i+1}: {sign} | \ud83d\udcac {r['comments']}\u6761")
+                egress_label = describe_egress_mode(r['egress_mode']) if r['egress_mode'] else '未知'
+                account_lines.append(f"\ud83d\udc64 \u8d26\u53f7{i+1}: {egress_label} | {sign} | \ud83d\udcac {r['comments']}\u6761")
         accounts_str = "\n".join(account_lines)
         report_message = f"""<b>NodeSeek \u6bcf\u65e5\u7b80\u62a5</b>
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
