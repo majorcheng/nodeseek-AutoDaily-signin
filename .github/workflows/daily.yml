@@ -1,57 +1,39 @@
 name: NodeSeek 自动签到
 
 on:
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
   schedule:
-    # 每天北京时间 0:10 (UTC 16:10)
     - cron: '10 16 * * *'
-    # 每天北京时间 12:20 (UTC 4:20)
     - cron: '20 4 * * *'
 
 jobs:
   run-nodeseek-daily:
     runs-on: ubuntu-22.04
     env:
-      NS_CHROME_PROFILE_DIR: ${{ vars.NS_CHROME_PROFILE_DIR || '.chrome-profile' }}
+      NS_BROWSER_STATE_DIR: ${{ vars.NS_BROWSER_STATE_DIR || '.browser-state' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore Chrome profile cache
-        id: restore-chrome-profile
+      - name: Restore browser state cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.NS_CHROME_PROFILE_DIR }}
-          key: nodeseek-profile-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          path: ${{ env.NS_BROWSER_STATE_DIR }}
+          key: nodeseek-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            nodeseek-profile-${{ runner.os }}-${{ github.ref_name }}-
+            nodeseek-state-${{ runner.os }}-${{ github.ref_name }}-
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Chrome and dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg xvfb
-
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-
-          echo "Chrome version:"
-          google-chrome --version
-
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-wqy-zenhei
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          scrapling install
 
       - name: Run NodeSeek script
         env:
@@ -59,16 +41,20 @@ jobs:
           NS_RANDOM: ${{ secrets.NS_RANDOM }}
           NS_COMMENT_URL: ${{ secrets.NS_COMMENT_URL }}
           NS_PROXY_URL: ${{ secrets.NS_PROXY_URL }}
-          NS_PROXY_INSECURE: ${{ vars.NS_PROXY_INSECURE }}
+          NS_USERNAME: ${{ secrets.NS_USERNAME }}
+          NS_PASSWORD: ${{ secrets.NS_PASSWORD }}
           NS_EGRESS_MODE: ${{ vars.NS_EGRESS_MODE }}
           NS_CF_WAIT_SECONDS: ${{ vars.NS_CF_WAIT_SECONDS }}
+          NS_CF_LOGIN_RETRIES: ${{ vars.NS_CF_LOGIN_RETRIES }}
+          NS_SKIP_COMMENTS: ${{ vars.NS_SKIP_COMMENTS }}
           NS_DELAY_MIN: ${{ vars.NS_DELAY_MIN }}
           NS_DELAY_MAX: ${{ vars.NS_DELAY_MAX }}
+          NS_HEADLESS: ${{ vars.NS_HEADLESS || 'true' }}
+          NS_BROWSER_STATE_DIR: ${{ env.NS_BROWSER_STATE_DIR }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          HEADLESS: "false"
         run: |
-          xvfb-run --auto-servernum python nodeseek_daily.py
+          python nodeseek_daily.py
 
       - name: Upload diagnostic artifacts
         if: always()
@@ -77,16 +63,12 @@ jobs:
           name: nodeseek-diagnostics-${{ github.run_id }}
           if-no-files-found: ignore
           path: |
-            login_check_failed.png
-            cf_block_sign.png
-            sign_intro_error.png
-            sign_exception.png
-            comment_main_error.png
-            comment_error_*.png
+            artifacts/**/*.png
+            artifacts/**/*.json
 
-      - name: Save Chrome profile cache
-        if: always() && hashFiles(format('{0}/.ns_profile_ok', env.NS_CHROME_PROFILE_DIR)) != ''
+      - name: Save browser state cache
+        if: always() && hashFiles(format('{0}/.ns_browser_state_ok', env.NS_BROWSER_STATE_DIR)) != ''
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.NS_CHROME_PROFILE_DIR }}
-          key: nodeseek-profile-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          path: ${{ env.NS_BROWSER_STATE_DIR }}
+          key: nodeseek-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}

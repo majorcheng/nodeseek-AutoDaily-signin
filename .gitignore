@@ -1,9 +1,4 @@
 __pycache__/
 *.pyc
-.chrome-profile/
-login_check_failed.png
-cf_block_sign.png
-sign_intro_error.png
-sign_exception.png
-comment_main_error.png
-comment_error_*.png
+.browser-state/
+artifacts/
