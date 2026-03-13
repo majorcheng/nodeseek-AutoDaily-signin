@@ -206,7 +206,7 @@ class Config:
             tg_chat_id=(source.get("TG_CHAT_ID") or "").strip() or None,
             comment_url=comment_url_env or DEFAULT_COMMENT_URL,
             delay_min=int_from_source("NS_DELAY_MIN", 0),
-            delay_max=int_from_source("NS_DELAY_MAX", 10),
+            delay_max=int_from_source("NS_DELAY_MAX", 0),
             proxy_url=(source.get("NS_PROXY_URL", "") or "").strip(),
             egress_mode=egress_mode,
             cf_wait_seconds=max(0, int_from_source("NS_CF_WAIT_SECONDS", 30)),

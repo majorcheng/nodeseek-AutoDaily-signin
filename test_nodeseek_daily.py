@@ -38,6 +38,7 @@ def test_config_from_env_with_empty_values_has_no_accounts_or_proxy():
     assert config.account_count == 0
     assert config.proxy_url == ""
     assert config.proxy_insecure is True
+    assert config.delay_max == 0
 
 
 def test_config_from_env_uses_injected_credentials_and_proxy_when_cookie_absent():

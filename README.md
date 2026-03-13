@@ -87,7 +87,7 @@ session=abc123xyz; token=def456uvw; user_id=12345
   - 默认 `0`
   - 整轮任务开始前的随机延迟最小分钟数
 - `NS_DELAY_MAX`
-  - 默认 `10`
+  - 默认 `0`
   - 整轮任务开始前的随机延迟最大分钟数
 - `NS_EGRESS_MODE`
   - 默认 `auto`
