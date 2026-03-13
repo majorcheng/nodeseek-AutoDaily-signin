@@ -1,8 +1,11 @@
 # NodeSeek 自动签到 - Scrapling 版
 
 基于 [Scrapling](https://github.com/D4Vinci/Scrapling) 的 NodeSeek 自动化脚本，
-使用浏览器态持久化 + Stealth 会话完成登录态检测、签到、随机评论和
-Telegram 汇总通知。
+使用浏览器态持久化 + `StealthySession` 完成登录态检测、签到、随机评论和
+Telegram 汇总通知，并通过 `solve_cloudflare` 配合页面交互处理 CF /
+Turnstile。
+
+推荐把登录信息和代理通过 GitHub Actions Secrets / Variables 注入，不要写进仓库。
 
 ## ✨ 功能
 
@@ -10,7 +13,7 @@ Telegram 汇总通知。
 - 💬 随机评论 4-7 篇帖子，帖子间随机等待 1-2 分钟
 - 👥 多账号支持，`NS_COOKIE` 用 `|` 分隔
 - 🌐 代理优先 / 直连兜底，支持 `auto`、`proxy`、`direct`
-- 🛡️ 使用 Scrapling `StealthySession`，支持 Cloudflare 处理
+- 🛡️ 使用 Scrapling `StealthySession` + `solve_cloudflare` 处理 Cloudflare / Turnstile
 - 💾 每账号独立浏览器状态目录，便于复用 Cookie / local storage
 - 📸 失败时保存截图到 `artifacts/`，并按需发送 Telegram 图片
 - 📱 单账号 / 多账号统一 Telegram 汇总通知
@@ -53,8 +56,9 @@ session=abc123xyz; token=def456uvw; user_id=12345
 ### Secrets
 
 - `NS_COOKIE`
-  - 必填
+  - 可选
   - NodeSeek Cookie，多账号用 `|` 分隔
+  - 留空时会直接走账号密码登录回退
 - `NS_RANDOM`
   - 可选
   - `true` 表示优先“试试手气”，`false` 表示优先“鸡腿 x 5”
@@ -121,7 +125,8 @@ session=abc123xyz; token=def456uvw; user_id=12345
 
 如果你当前目标是先在本地验证“能签到”，建议优先准备一份当前有效的 `NS_COOKIE`；
 再配合 `NS_EGRESS_MODE=direct` 与 `NS_SKIP_COMMENTS=true`，先把“登录态校验 + 签到”跑通。
-账号密码真实登录链路仍然保留，便于后续继续攻 Cloudflare / Turnstile。
+账号密码真实登录链路由 Scrapling `StealthySession` 驱动，并开启
+`solve_cloudflare`，用于继续处理 Cloudflare / Turnstile。
 
 ## 🌐 代理与缓存行为
 

@@ -165,7 +165,7 @@ class Config:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config":
-        source = env or os.environ
+        source = os.environ if env is None else env
         raw_cookie = source.get("NS_COOKIE", "") or ""
         cookies = parse_account_values(raw_cookie)
         usernames = parse_account_values(source.get("NS_USERNAME", "") or "")
@@ -769,8 +769,8 @@ def should_retry_clean_login(snapshot: dict[str, Any], attempt_result: dict[str,
         return False
     if int(snapshot.get("sign_in_request_count", 0) or 0) > 0:
         return False
-    if int(snapshot.get("challenge_pat_401_count", 0) or 0) > 0:
-        return True
+    if int(snapshot.get("challenge_pat_401_count", 0) or 0) > 0 and int(snapshot.get("challenge_request_count", 0) or 0) > 0:
+        return False
     return bool(snapshot.get("turnstile_frame_found") or snapshot.get("captcha_container_present"))
 
 
@@ -899,6 +899,8 @@ def sanitize_login_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "sign_in_request_count": snapshot.get("sign_in_request_count"),
         "sign_in_response_status": snapshot.get("sign_in_response_status"),
         "challenge_pat_401_count": snapshot.get("challenge_pat_401_count"),
+        "challenge_request_count": snapshot.get("challenge_request_count"),
+        "challenge_response_count": snapshot.get("challenge_response_count"),
         "embedded_solver_attempts": snapshot.get("embedded_solver_attempts"),
         "used_clean_state": snapshot.get("used_clean_state"),
         "live_failure_screenshot_path": snapshot.get("live_failure_screenshot_path"),
@@ -1065,6 +1067,10 @@ def print_login_diagnostics(reason: str, snapshot: dict[str, Any]) -> None:
         print(f"登录接口状态: HTTP {snapshot.get('sign_in_response_status')}")
     if snapshot.get("challenge_pat_401_count"):
         print(f"PAT 401 次数: {snapshot.get('challenge_pat_401_count')}")
+    if snapshot.get("challenge_request_count"):
+        print(f"Challenge 请求次数: {snapshot.get('challenge_request_count')}")
+    if snapshot.get("challenge_response_count"):
+        print(f"Challenge 响应次数: {snapshot.get('challenge_response_count')}")
     if snapshot.get("embedded_solver_attempts"):
         print(f"embedded solver 次数: {snapshot.get('embedded_solver_attempts')}")
     stage_screenshots = snapshot.get("stage_screenshots")
@@ -1355,6 +1361,36 @@ def read_turnstile_state(page: Any) -> dict[str, Any]:
     }
 
 
+def build_turnstile_click_positions(width: float, height: float) -> list[tuple[float, float]]:
+    width = max(float(width or 0), 80.0)
+    height = max(float(height or 0), 32.0)
+    left_anchor = min(max(width * 0.06, 10.0), 20.0)
+    center_y = min(max(height * 0.5, 20.0), height - 10.0)
+    lower_y = min(center_y + 6.0, height - 8.0)
+    right_probe = min(max(width * 0.16, left_anchor + 12.0), 72.0)
+
+    positions = [
+        (left_anchor, center_y),
+        (left_anchor + 6.0, center_y),
+        (left_anchor + 6.0, lower_y),
+        (left_anchor + 12.0, center_y),
+        (left_anchor + 12.0, lower_y),
+        (right_probe, lower_y),
+    ]
+
+    normalized_positions: list[tuple[float, float]] = []
+    seen: set[tuple[int, int]] = set()
+    for x_pos, y_pos in positions:
+        clamped_x = min(max(x_pos, 6.0), width - 6.0)
+        clamped_y = min(max(y_pos, 6.0), height - 6.0)
+        marker = (round(clamped_x), round(clamped_y))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        normalized_positions.append((clamped_x, clamped_y))
+    return normalized_positions
+
+
 def login_with_credentials(
     session: StealthySession,
     username: str,
@@ -1380,6 +1416,8 @@ def login_with_credentials(
         "sign_in_response_status": None,
         "sign_in_response_ok": None,
         "challenge_pat_401_count": 0,
+        "challenge_request_count": 0,
+        "challenge_response_count": 0,
     }
 
     def action(page: Any) -> None:
@@ -1388,6 +1426,7 @@ def login_with_credentials(
         page.wait_for_timeout(2_000)
         turnstile_stage_captured = False
         embedded_solver_attempts = 0
+        last_solver_trigger_second = -10
 
         def sync_network_state(turnstile_state: dict[str, Any] | None = None) -> None:
             snapshot.update(network_state)
@@ -1447,12 +1486,14 @@ def login_with_credentials(
             except Exception:
                 page.wait_for_timeout(500)
 
-        def click_turnstile_box(turnstile_frame: Any | None) -> bool:
-            strategies: list[tuple[str, Any | None, bool]] = []
+        def click_turnstile_box(turnstile_frame: Any | None, attempt_index: int) -> bool:
+            iframe_locator = page.locator("iframe[src*='challenges.cloudflare.com']").last
+            iframe_bbox: dict[str, float] | None = None
+
             if turnstile_frame is not None:
                 try:
                     frame_element = turnstile_frame.frame_element()
-                    strategies.append(("iframe_box", frame_element.bounding_box(), True))
+                    iframe_bbox = frame_element.bounding_box()
                 except Exception:
                     pass
                 try:
@@ -1470,6 +1511,54 @@ def login_with_credentials(
                 except Exception:
                     pass
 
+            try:
+                if iframe_locator.count() > 0:
+                    iframe_bbox = iframe_locator.bounding_box() or iframe_bbox
+            except Exception:
+                pass
+
+            if iframe_bbox:
+                click_positions = build_turnstile_click_positions(
+                    float(iframe_bbox.get("width") or 0),
+                    float(iframe_bbox.get("height") or 0),
+                )
+                if click_positions:
+                    primary_index = (max(attempt_index, 1) - 1) % len(click_positions)
+                    ordered_positions = click_positions[primary_index:] + click_positions[:primary_index]
+                    for click_x, click_y in ordered_positions:
+                        try:
+                            if iframe_locator.count() > 0:
+                                iframe_locator.hover(timeout=5_000)
+                                page.wait_for_timeout(150)
+                                iframe_locator.click(
+                                    position={"x": click_x, "y": click_y},
+                                    timeout=5_000,
+                                    force=True,
+                                )
+                                snapshot["embedded_solver_last_strategy"] = (
+                                    f"iframe_locator@{round(click_x)},{round(click_y)}"
+                                )
+                                return True
+                        except Exception:
+                            pass
+
+                        try:
+                            absolute_x = float(iframe_bbox["x"]) + click_x
+                            absolute_y = float(iframe_bbox["y"]) + click_y
+                            page.mouse.move(absolute_x - 8, absolute_y - 4, steps=10)
+                            page.mouse.move(absolute_x, absolute_y, steps=8)
+                            page.mouse.click(
+                                absolute_x,
+                                absolute_y,
+                                delay=random.randint(120, 220),
+                                button="left",
+                            )
+                            snapshot["embedded_solver_last_strategy"] = f"iframe_mouse@{round(click_x)},{round(click_y)}"
+                            return True
+                        except Exception:
+                            continue
+
+            strategies: list[tuple[str, Any | None, bool]] = []
             for selector in ("#captcha-container iframe", "#captcha-container", "#cf_turnstile", "#cf-turnstile", ".turnstile"):
                 try:
                     locator = page.locator(selector)
@@ -1497,31 +1586,46 @@ def login_with_credentials(
                     continue
             return False
 
-        def run_embedded_turnstile_solver(turnstile_state: dict[str, Any]) -> dict[str, Any]:
-            nonlocal embedded_solver_attempts
-            max_solver_attempts = max(1, config.cf_login_retries)
+        def run_embedded_turnstile_solver(turnstile_state: dict[str, Any], elapsed_seconds: int) -> dict[str, Any]:
+            nonlocal embedded_solver_attempts, last_solver_trigger_second
+            max_solver_attempts = max(6, config.cf_login_retries * 4)
             current_state = turnstile_state
-            while embedded_solver_attempts < max_solver_attempts:
-                if current_state.get("token_present") or network_state["sign_in_request_count"]:
-                    break
-                turnstile_frame = maybe_capture_turnstile_stage(current_state)
-                if turnstile_frame is None and not current_state.get("captcha_container_present"):
-                    break
-                embedded_solver_attempts += 1
-                snapshot["embedded_solver_attempts"] = embedded_solver_attempts
-                print(f"🧩 开始执行 embedded Turnstile 求解，第 {embedded_solver_attempts}/{max_solver_attempts} 次")
-                if not click_turnstile_box(turnstile_frame):
-                    break
-                wait_for_challenge_settle()
-                page.wait_for_timeout(1_000)
-                current_state = read_turnstile_state(page)
-                sync_network_state(current_state)
+
+            if current_state.get("token_present") or network_state["sign_in_request_count"]:
+                return current_state
+
+            turnstile_frame = maybe_capture_turnstile_stage(current_state)
+            if turnstile_frame is None and not current_state.get("captcha_container_present"):
+                return current_state
+
+            if embedded_solver_attempts >= max_solver_attempts:
+                return current_state
+
+            pat_seen = int(network_state.get("challenge_pat_401_count", 0) or 0) > 0
+            should_probe_after_wait = elapsed_seconds >= 4 and embedded_solver_attempts == 0
+            should_retry_click = pat_seen and (elapsed_seconds - last_solver_trigger_second >= 2)
+            if not (should_probe_after_wait or should_retry_click):
+                return current_state
+
+            embedded_solver_attempts += 1
+            last_solver_trigger_second = elapsed_seconds
+            snapshot["embedded_solver_attempts"] = embedded_solver_attempts
+            print(f"🧩 开始执行 embedded Turnstile 求解，第 {embedded_solver_attempts}/{max_solver_attempts} 次")
+            if not click_turnstile_box(turnstile_frame, embedded_solver_attempts):
+                return current_state
+
+            wait_for_challenge_settle()
+            page.wait_for_timeout(1_000)
+            current_state = read_turnstile_state(page)
+            sync_network_state(current_state)
             return current_state
 
         def on_request(request: Any) -> None:
             request_url = getattr(request, "url", "") or ""
             if "/api/account/signIn" in request_url:
                 network_state["sign_in_request_count"] = int(network_state["sign_in_request_count"] or 0) + 1
+            if "challenge-platform" in request_url:
+                network_state["challenge_request_count"] = int(network_state["challenge_request_count"] or 0) + 1
 
         def on_response(response: Any) -> None:
             response_url = getattr(response, "url", "") or ""
@@ -1530,6 +1634,8 @@ def login_with_credentials(
                 network_state["sign_in_response_status"] = response_status
                 if response_status is not None:
                     network_state["sign_in_response_ok"] = int(response_status) < 400
+            if "challenge-platform" in response_url:
+                network_state["challenge_response_count"] = int(network_state["challenge_response_count"] or 0) + 1
             if response_status == 401 and (
                 "private-access-token" in response_url
                 or "challenge-platform" in response_url
@@ -1569,20 +1675,22 @@ def login_with_credentials(
         login_button.first.hover(timeout=3_000)
         page.wait_for_timeout(300)
         login_button.first.click(timeout=5_000)
-        page.wait_for_timeout(1_500)
+        page.wait_for_timeout(500)
 
         turnstile_state = read_turnstile_state(page)
         maybe_capture_turnstile_stage(turnstile_state)
-        turnstile_state = run_embedded_turnstile_solver(turnstile_state)
-
         token_wait_seconds = max(config.cf_wait_seconds, 10)
-        for _ in range(token_wait_seconds):
-            page.wait_for_timeout(1_000)
+        for elapsed_seconds in range(token_wait_seconds + 1):
+            if elapsed_seconds > 0:
+                page.wait_for_timeout(1_000)
             turnstile_state = read_turnstile_state(page)
             maybe_capture_turnstile_stage(turnstile_state)
+            sync_network_state(turnstile_state)
             if turnstile_state.get("token_present") or network_state["sign_in_request_count"]:
                 break
-            turnstile_state = run_embedded_turnstile_solver(turnstile_state)
+            turnstile_state = run_embedded_turnstile_solver(turnstile_state, elapsed_seconds)
+            if turnstile_state.get("token_present") or network_state["sign_in_request_count"]:
+                break
 
         sync_network_state(turnstile_state)
 
@@ -1634,6 +1742,7 @@ def login_with_credentials(
             timeout=browser_timeout_ms(),
             google_search=False,
             load_dom=True,
+            solve_cloudflare=False,
         )
     except Exception as exc:
         reason = f"真实登录流程执行失败: {exc}"
