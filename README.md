@@ -1,7 +1,7 @@
 # NodeSeek 自动签到 - Scrapling 版
 
 基于 [Scrapling](https://github.com/D4Vinci/Scrapling) 的 NodeSeek 自动化脚本，
-使用浏览器态持久化 + `StealthySession` 完成登录态检测、签到、随机评论和
+使用浏览器态持久化 + `StealthySession` 完成登录态检测、签到和
 Telegram 汇总通知，并通过 `solve_cloudflare` 配合页面交互处理 CF /
 Turnstile。
 
@@ -10,7 +10,6 @@ Turnstile。
 ## ✨ 功能
 
 - ✅ 自动签到，支持“试试手气”与“鸡腿 x 5”偏好
-- 💬 随机评论 4-7 篇帖子，帖子间随机等待 1-2 分钟
 - 👥 多账号支持，`NS_COOKIE` 用 `|` 分隔
 - 🌐 代理优先 / 直连兜底，支持 `auto`、`proxy`、`direct`
 - 🛡️ 使用 Scrapling `StealthySession` + `solve_cloudflare` 处理 Cloudflare / Turnstile
@@ -62,9 +61,6 @@ session=abc123xyz; token=def456uvw; user_id=12345
 - `NS_RANDOM`
   - 可选
   - `true` 表示优先“试试手气”，`false` 表示优先“鸡腿 x 5”
-- `NS_COMMENT_URL`
-  - 可选
-  - 评论区地址，默认是交易区
 - `NS_PROXY_URL`
   - 可选
   - 浏览器流量代理地址
@@ -105,9 +101,6 @@ session=abc123xyz; token=def456uvw; user_id=12345
   - 默认 `true`
   - 仅在 `NS_PROXY_URL` 为 `https://...` 且当前出口走代理时生效
   - `true` 表示只跳过“脚本连接上游 HTTPS 代理”这一跳的证书校验，不会关闭 NodeSeek 站点本身的 HTTPS 校验
-- `NS_SKIP_COMMENTS`
-  - 默认 `false`
-  - 设为 `true` 时只做登录态校验 + 签到，跳过评论流程
 - `NS_USER_AGENT`
   - 可选
   - 覆盖 Scrapling 浏览器默认 UA，便于复现指定浏览器环境
@@ -124,7 +117,7 @@ session=abc123xyz; token=def456uvw; user_id=12345
 当 `NS_COOKIE` 缺失、为空，或首页检测判定 Cookie 已失效时，脚本会在当前账号同时配置了 `NS_USERNAME` + `NS_PASSWORD` 的情况下尝试真实登录回退。
 
 如果你当前目标是先在本地验证“能签到”，建议优先准备一份当前有效的 `NS_COOKIE`；
-再配合 `NS_EGRESS_MODE=direct` 与 `NS_SKIP_COMMENTS=true`，先把“登录态校验 + 签到”跑通。
+再配合 `NS_EGRESS_MODE=direct`，先把“登录态校验 + 签到”跑通。
 账号密码真实登录链路由 Scrapling `StealthySession` 驱动，并开启
 `solve_cloudflare`，用于继续处理 Cloudflare / Turnstile。
 
@@ -167,13 +160,12 @@ python nodeseek_daily.py
 export NS_COOKIE='当前有效Cookie'
 export NS_HEADLESS='true'
 export NS_EGRESS_MODE='direct'
-export NS_SKIP_COMMENTS='true'
 export NS_DELAY_MIN='0'
 export NS_DELAY_MAX='0'
 python nodeseek_daily.py
 ```
 
-这条命令的成功口径是：识别到已登录状态，并完成签到或返回“今日已签”；评论会明确标记为已跳过。
+这条命令的成功口径是：识别到已登录状态，并完成签到或返回“今日已签”。
 
 如需临时模拟指定浏览器请求头，可这样运行：
 
@@ -223,8 +215,6 @@ artifacts/account-2/
 - `cf_block_sign.png`
 - `sign_intro_error.png`
 - `sign_exception.png`
-- `comment_main_error.png`
-- `comment_error_0.png`
 
 GitHub Actions 会自动上传 `artifacts/**/*.png`。
 
@@ -242,7 +232,7 @@ GitHub Actions 会自动上传 `artifacts/**/*.png`。
 - Cookie 过期
 - 站点页面结构变更
 - 命中 Cloudflare 挑战且超出等待时间
-- 评论区或签到页改版，导致选择器失效
+- 签到页改版，导致选择器失效
 
 ### 3. 为什么缓存没保存？
 

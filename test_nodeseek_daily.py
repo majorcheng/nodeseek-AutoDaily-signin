@@ -114,3 +114,52 @@ def test_should_retry_clean_login_skips_duplicate_pat401_retries():
     )
 
     assert should_retry is False
+
+
+def test_finalize_authenticated_session_only_handles_signin(monkeypatch: Any):
+    import nodeseek_daily
+
+    state_marks = {"count": 0}
+
+    def fake_mark_state_success() -> None:
+        state_marks["count"] += 1
+
+    monkeypatch.setattr(nodeseek_daily, "mark_state_success", fake_mark_state_success)
+    monkeypatch.setattr(nodeseek_daily, "click_sign_icon", lambda session, account_index: ("success", "5"))
+
+    result = {
+        "sign_in": "failed",
+        "reward": "0",
+        "error": "旧错误",
+        "egress_mode": nodeseek_daily.EGRESS_DIRECT,
+        "failure_class": "old_failure",
+    }
+
+    updated = nodeseek_daily.finalize_authenticated_session(object(), 0, result)
+
+    assert updated["sign_in"] == "success"
+    assert updated["reward"] == "5"
+    assert updated["error"] is None
+    assert updated["failure_class"] is None
+    assert "comments" not in updated
+    assert "comments_skipped" not in updated
+    assert state_marks["count"] == 2
+
+
+def test_build_report_message_no_longer_contains_comment_field():
+    import nodeseek_daily
+
+    message = nodeseek_daily.build_report_message(
+        [
+            {
+                "sign_in": "success",
+                "reward": "5",
+                "error": None,
+                "egress_mode": nodeseek_daily.EGRESS_DIRECT,
+                "failure_class": None,
+            }
+        ]
+    )
+
+    assert "评论" not in message
+    assert "💬" not in message

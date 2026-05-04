@@ -39,7 +39,6 @@ jobs:
         env:
           NS_COOKIE: ${{ secrets.NS_COOKIE }}
           NS_RANDOM: ${{ secrets.NS_RANDOM }}
-          NS_COMMENT_URL: ${{ secrets.NS_COMMENT_URL }}
           NS_PROXY_URL: ${{ secrets.NS_PROXY_URL }}
           NS_PROXY_INSECURE: ${{ vars.NS_PROXY_INSECURE }}
           NS_USERNAME: ${{ secrets.NS_USERNAME }}
@@ -47,7 +46,6 @@ jobs:
           NS_EGRESS_MODE: ${{ vars.NS_EGRESS_MODE }}
           NS_CF_WAIT_SECONDS: ${{ vars.NS_CF_WAIT_SECONDS }}
           NS_CF_LOGIN_RETRIES: ${{ vars.NS_CF_LOGIN_RETRIES }}
-          NS_SKIP_COMMENTS: ${{ vars.NS_SKIP_COMMENTS }}
           NS_DELAY_MIN: ${{ vars.NS_DELAY_MIN }}
           NS_DELAY_MAX: ${{ vars.NS_DELAY_MAX }}
           NS_HEADLESS: ${{ vars.NS_HEADLESS || 'true' }}

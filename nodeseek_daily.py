@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Mapping, Sequence
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
@@ -34,7 +34,6 @@ except Exception as exc:  # pragma: no cover - 允许未装依赖时做静态校
 HOME_URL = "https://www.nodeseek.com"
 LOGIN_URL = f"{HOME_URL}/signIn.html"
 BOARD_URL = f"{HOME_URL}/board"
-DEFAULT_COMMENT_URL = f"{HOME_URL}/categories/trade"
 ARTIFACT_ROOT = Path("artifacts")
 STATE_SUCCESS_MARKER = ".ns_browser_state_ok"
 
@@ -48,22 +47,6 @@ LOGIN_STATUS_COOKIE_INVALID = "cookie_invalid"
 LOGIN_STATUS_UNKNOWN_PAGE = "unknown_page"
 LOGIN_STATUS_EGRESS_FAILED = "egress_failed"
 LOGIN_STATUS_LOGIN_FAILED = "login_failed"
-
-COMMENT_POOL = [
-    "bd",
-    "绑定",
-    "帮顶",
-    ":xhj007: BD",
-    "好价",
-    "过来看一下",
-    ":xhj025: 嚯",
-    "可以",
-    ":xhj003: 可以",
-    "还可以",
-    ":xhj010: 顶",
-    "bd一下",
-    ":xhj027: 哦",
-]
 
 CHALLENGE_TITLES = ("Just a moment", "Attention Required")
 CHALLENGE_KEYWORDS = (
@@ -148,7 +131,6 @@ class Config:
     headless: bool
     tg_bot_token: str | None
     tg_chat_id: str | None
-    comment_url: str
     delay_min: int
     delay_max: int
     proxy_url: str
@@ -156,7 +138,6 @@ class Config:
     cf_wait_seconds: int
     cf_login_retries: int
     proxy_insecure: bool
-    skip_comments: bool
     browser_state_dir: str
     user_agent: str | None
     extra_headers: dict[str, str]
@@ -168,7 +149,6 @@ class Config:
         cookies = parse_account_values(raw_cookie)
         usernames = parse_account_values(source.get("NS_USERNAME", "") or "")
         passwords = parse_account_values(source.get("NS_PASSWORD", "") or "")
-        comment_url_env = (source.get("NS_COMMENT_URL", "") or "").strip()
         egress_mode = ((source.get("NS_EGRESS_MODE", "auto") or "auto").strip().lower() or "auto")
         if egress_mode not in {"auto", "proxy", "direct"}:
             egress_mode = "auto"
@@ -202,7 +182,6 @@ class Config:
             headless=bool_from_source("NS_HEADLESS", True),
             tg_bot_token=(source.get("TG_BOT_TOKEN") or "").strip() or None,
             tg_chat_id=(source.get("TG_CHAT_ID") or "").strip() or None,
-            comment_url=comment_url_env or DEFAULT_COMMENT_URL,
             delay_min=int_from_source("NS_DELAY_MIN", 0),
             delay_max=int_from_source("NS_DELAY_MAX", 0),
             proxy_url=(source.get("NS_PROXY_URL", "") or "").strip(),
@@ -210,7 +189,6 @@ class Config:
             cf_wait_seconds=max(0, int_from_source("NS_CF_WAIT_SECONDS", 30)),
             cf_login_retries=max(1, int_from_source("NS_CF_LOGIN_RETRIES", 2)),
             proxy_insecure=bool_from_source("NS_PROXY_INSECURE", True),
-            skip_comments=bool_from_source("NS_SKIP_COMMENTS", False),
             browser_state_dir=((source.get("NS_BROWSER_STATE_DIR", ".browser-state") or ".browser-state").strip() or ".browser-state"),
             user_agent=(source.get("NS_USER_AGENT", "") or "").strip() or None,
             extra_headers=extra_headers,
@@ -1783,14 +1761,6 @@ def choose_sign_button_index(button_texts: Sequence[str], prefer_random: bool | 
     return None
 
 
-def pick_comment_targets(post_urls: Sequence[str], rng: Any = random) -> list[str]:
-    deduped = list(dict.fromkeys(post_urls))
-    if not deduped:
-        return []
-    selected_count = rng.randint(4, 7)
-    return rng.sample(deduped, min(selected_count, len(deduped)))
-
-
 def pick_global_sign_button(page: Any) -> tuple[Any | None, str]:
     preferred_selectors = []
     if config.ns_random:
@@ -1944,212 +1914,6 @@ def click_sign_icon(session: StealthySession, account_index: int) -> tuple[str, 
     return str(details.get("status", "failed")), str(details.get("message", "状态未知"))
 
 
-def collect_comment_post_urls(session: StealthySession, account_index: int) -> tuple[list[str], str | None]:
-    details: dict[str, Any] = {"post_urls": []}
-    screenshot_path = build_account_artifact_path(account_index, "comment_main_error.png")
-
-    def action(page: Any) -> None:
-        try:
-            print(f"开始加载评论区: {config.comment_url}")
-            page.wait_for_selector(".post-list-item", state="attached", timeout=30_000)
-            update_snapshot_from_page(page, details)
-            if is_cloudflare_snapshot(details):
-                details["error"] = "评论列表页面遭遇 Cloudflare 拦截"
-                details["screenshot_path"] = save_page_screenshot(page, screenshot_path)
-                return
-
-            posts = page.locator(".post-list-item")
-            total = posts.count()
-            print(f"成功获取到 {total} 个帖子")
-            urls: list[str] = []
-            for idx in range(total):
-                post = posts.nth(idx)
-                if post.locator(".pined").count() > 0:
-                    continue
-                link = post.locator(".post-title a")
-                if link.count() == 0:
-                    continue
-                href = link.first.get_attribute("href")
-                if not href:
-                    continue
-                urls.append(urljoin(HOME_URL, href))
-            details["post_urls"] = urls
-        except Exception as exc:
-            details["error"] = f"加载评论列表失败: {exc}"
-            details["traceback"] = traceback.format_exc()
-            details["screenshot_path"] = save_page_screenshot(page, screenshot_path)
-
-    try:
-        session.fetch(
-            config.comment_url,
-            page_action=action,
-            wait_selector="body",
-            timeout=browser_timeout_ms(),
-            google_search=False,
-            load_dom=True,
-        )
-    except Exception as exc:
-        return [], f"评论列表请求失败: {exc}"
-
-    if details.get("error"):
-        if details.get("screenshot_path"):
-            send_telegram_photo(details["screenshot_path"], caption=f"❌ 评论列表加载失败\n错误: {details['error']}")
-        return [], str(details["error"])
-
-    post_urls = details.get("post_urls", []) or []
-    if not post_urls:
-        return [], "未找到可评论的帖子"
-    return [str(url) for url in post_urls], None
-
-
-def fill_codemirror(page: Any, text: str) -> bool:
-    script = """
-    ({ selector, value }) => {
-      const root = document.querySelector(selector);
-      if (!root) return false;
-
-      if (root.CodeMirror) {
-        root.CodeMirror.setValue(value);
-        root.CodeMirror.focus();
-        return true;
-      }
-
-      const inner = root.querySelector('.CodeMirror');
-      if (inner && inner.CodeMirror) {
-        inner.CodeMirror.setValue(value);
-        inner.CodeMirror.focus();
-        return true;
-      }
-
-      const textarea = root.querySelector('textarea');
-      if (textarea) {
-        textarea.value = value;
-        textarea.dispatchEvent(new Event('input', { bubbles: true }));
-        textarea.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }
-
-      return false;
-    }
-    """
-    try:
-        return bool(page.evaluate(script, {"selector": ".CodeMirror", "value": text}))
-    except Exception:
-        return False
-
-
-def comment_on_post(
-    session: StealthySession,
-    account_index: int,
-    post_url: str,
-    comment_text: str,
-    comment_index: int,
-) -> tuple[bool, str | None, str | None]:
-    details: dict[str, Any] = {}
-    screenshot_path = build_account_artifact_path(account_index, f"comment_error_{comment_index}.png")
-
-    def action(page: Any) -> None:
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=browser_timeout_ms())
-            update_snapshot_from_page(page, details)
-
-            if is_cloudflare_snapshot(details):
-                details["error"] = "页面加载遭遇 Cloudflare"
-                details["screenshot_path"] = save_page_screenshot(page, screenshot_path)
-                return
-
-            if "error" in (details.get("title", "") or "").lower():
-                details["error"] = "页面加载异常"
-                details["screenshot_path"] = save_page_screenshot(page, screenshot_path)
-                return
-
-            page.wait_for_selector(".CodeMirror", state="attached", timeout=30_000)
-            editor = page.locator(".CodeMirror").first
-            editor.click()
-            page.wait_for_timeout(500)
-
-            if not fill_codemirror(page, comment_text):
-                page.keyboard.type(comment_text, delay=random.randint(80, 200))
-
-            page.wait_for_timeout(1_000)
-            submit_button = page.locator(
-                "xpath=//button[contains(@class, 'submit') and contains(@class, 'btn') and contains(text(), '发布评论')]"
-            ).first
-            if submit_button.count() == 0:
-                details["error"] = "未找到发布评论按钮"
-                details["screenshot_path"] = save_page_screenshot(page, screenshot_path)
-                return
-
-            submit_button.scroll_into_view_if_needed()
-            submit_button.click()
-            page.wait_for_timeout(2_000)
-            update_snapshot_from_page(page, details)
-            details["ok"] = True
-        except Exception as exc:
-            details["error"] = f"处理帖子时出错: {exc}"
-            details["traceback"] = traceback.format_exc()
-            details["screenshot_path"] = save_page_screenshot(page, screenshot_path)
-
-    try:
-        session.fetch(
-            post_url,
-            page_action=action,
-            wait_selector="body",
-            timeout=browser_timeout_ms(),
-            google_search=False,
-            load_dom=True,
-        )
-    except Exception as exc:
-        return False, f"评论请求失败: {exc}", None
-
-    if details.get("ok"):
-        return True, None, None
-    return False, str(details.get("error", "评论失败")), details.get("screenshot_path")
-
-
-def nodeseek_comment(session: StealthySession, account_index: int) -> int:
-    comment_count = 0
-    selected_urls, error = collect_comment_post_urls(session, account_index)
-    if error:
-        print(f"NodeSeek 评论列表阶段失败: {error}")
-        return comment_count
-
-    pick_count = random.randint(4, 7)
-    selected_urls = random.sample(selected_urls, min(pick_count, len(selected_urls)))
-    consecutive_failures = 0
-
-    for index, post_url in enumerate(selected_urls):
-        if consecutive_failures >= 2:
-            print(f"⚠️ 连续失败 {consecutive_failures} 次，停止评论任务")
-            break
-
-        print(f"正在处理第 {index + 1} 个帖子: {post_url}")
-        comment_text = random.choice(COMMENT_POOL)
-        ok, error_message, screenshot_path = comment_on_post(session, account_index, post_url, comment_text, index)
-        if ok:
-            comment_count += 1
-            consecutive_failures = 0
-            print(f"已在帖子中完成评论: {post_url}")
-            wait_minutes = random.uniform(1, 2)
-            print(f"等待 {wait_minutes:.1f} 分钟后继续...")
-            time.sleep(wait_minutes * 60)
-            continue
-
-        consecutive_failures += 1
-        print(error_message or "评论失败")
-        if screenshot_path and index == 0:
-            send_telegram_photo(screenshot_path, caption=f"❌ 评论失败截图\n帖子: {post_url}\n错误: {error_message}")
-
-    print("评论任务完成")
-    return comment_count
-
-
-def format_comment_result(result: dict[str, Any]) -> str:
-    if result.get("comments_skipped"):
-        return "已跳过"
-    return f"{result['comments']} 条"
-
-
 def finalize_authenticated_session(
     session: StealthySession,
     account_index: int,
@@ -2164,15 +1928,6 @@ def finalize_authenticated_session(
     result["reward"] = reward
     if sign_status in {"success", "already"}:
         mark_state_success()
-
-    if config.skip_comments:
-        print("⏭️ 已启用 NS_SKIP_COMMENTS，跳过评论流程")
-        result["comments"] = 0
-        result["comments_skipped"] = True
-        return result
-
-    result["comments"] = nodeseek_comment(session, account_index)
-    result["comments_skipped"] = False
     return result
 
 
@@ -2180,8 +1935,6 @@ def run_for_account(cookie_str: str, username: str, password: str, account_index
     result = {
         "sign_in": "failed",
         "reward": "0",
-        "comments": 0,
-        "comments_skipped": False,
         "error": None,
         "egress_mode": None,
         "failure_class": None,
@@ -2331,7 +2084,6 @@ def build_report_message(all_results: list[dict[str, Any]]) -> str:
 👤 <b>账号</b>: 账号 1
 🌐 <b>出口</b>: {egress_label}
 🏆 <b>奖励</b>: <b>{result['reward']}</b> 🍗
-💬 <b>评论</b>: {format_comment_result(result)}
 ━━━━━━━━━━━━━━━
 {sign_status} <b>状态</b>: {sign_result}
 🕒 {beijing_time}"""
@@ -2346,7 +2098,7 @@ def build_report_message(all_results: list[dict[str, Any]]) -> str:
 
         sign = f"✅ +{result['reward']}🍗" if result["sign_in"] in {"success", "already"} else "❌"
         egress_label = describe_egress_mode(result["egress_mode"])
-        account_lines.append(f"👤 账号{idx + 1}: {egress_label} | {sign} | 💬 {format_comment_result(result)}")
+        account_lines.append(f"👤 账号{idx + 1}: {egress_label} | {sign}")
 
     accounts_str = "\n".join(account_lines)
     return f"""<b>NodeSeek 每日简报</b>
@@ -2362,7 +2114,7 @@ def main() -> int:
         f"当前配置: NS_RANDOM={config.ns_random}, NS_HEADLESS={config.headless}, "
         f"PROXY={mask_proxy_url(config.proxy_url)}, PROXY_INSECURE={config.proxy_insecure}, EGRESS_MODE={config.egress_mode}, "
         f"CF_WAIT={config.cf_wait_seconds}s, CF_LOGIN_RETRIES={config.cf_login_retries}, "
-        f"SKIP_COMMENTS={config.skip_comments}, STATE_DIR={config.browser_state_dir}"
+        f"STATE_DIR={config.browser_state_dir}"
     )
 
     clear_state_success_marker()
